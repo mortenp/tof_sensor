@@ -1577,9 +1577,12 @@ ESP_LOGI(TAG, "VL53L5CX ULD ready! (Version: %s)", VL53L5CX_API_REVISION);
 #ifdef useAccelerometer
 ESP_LOGI("MAIN", "Creating task for Accelerometer");
     xTaskCreate(mpu9250_reader_task, "MPU Reader", 4096, mpu9250_dev_handle, 5, NULL);
-#endif
+
 
     xTaskCreate(data_processor_task, "Data Processor", 4096, NULL, 3, NULL);
+    #endif
+
+    
     xTaskCreate(vl53l5cx_reader_task, "VL53L5CX Reader", 8192, &task_params, 5, NULL);
 
 
