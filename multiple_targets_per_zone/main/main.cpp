@@ -172,7 +172,10 @@ static led_strip_handle_t led_strip = NULL;
 // Audio alert parameters
 #define BEEP_DUTY_CYCLE         512  // 50% duty cycle for clear tone
 
-static bool useAcc = 1;
+//static bool useAcc = 0;
+//#define  useAccelerometer 0
+#undef useAccelerometer
+#undef useRGBLed
 
 
  int ALERT_IMMEDIATE_LIMIT = 40;
@@ -183,7 +186,19 @@ static bool useAcc = 1;
     int ALERT_VERYFAR_LIMIT  = 300;
 #define HYSTERESIS 15  // cm
 
+   // Static arrays for grid layout and alerts
+    static const uint8_t gridLayout[4][4] = {
+        {0, 1, 2, 3},
+        {4, 5, 6, 7},
+        {8, 9, 10, 11},
+        {12, 13, 14, 15}
+    };
+    static alert_level_t gridAlerts[16];
+
+
+#ifdef useRGBLed
 SemaphoreHandle_t led_strip_mutex;
+#endif
 SemaphoreHandle_t g_i2c_bus_mutex;
 
 // ----------------------------------------------------------------
@@ -191,12 +206,13 @@ SemaphoreHandle_t g_i2c_bus_mutex;
 // ----------------------------------------------------------------
 
 // Low-level LED helper functions
+#ifdef useRGBLed
 void rgb_led_init();
 void rgb_led_off(); // <-- This is the missing declaration
 void rgb_led_set_color(uint8_t r, uint8_t g, uint8_t b);
 void rgb_led_set_color_with_brightness(uint8_t r, uint8_t g, uint8_t b, float brightness);
 uint8_t gamma_correct(uint8_t val);
-
+#endif
 
 // Beeper helper functions
 esp_err_t init_piezo_beeper(void);
@@ -207,13 +223,19 @@ alert_level_t get_alert_level(uint16_t distance_cm);
 void update_beeper_alerts(alert_level_t new_level);
 
 // Task functions
+
+#ifdef useRGBLed
 void led_control_task(void *pvParameters);
+#endif
+#ifdef useAccelerometer
 void mpu9250_reader_task(void *pvParameters);
 void data_processor_task(void *pvParameters);
+#endif
+
 void vl53l5cx_reader_task(void *pvParameters);
 bool vl53l5cx_recover(VL53L5CX_Configuration *dev);
 
-
+#ifdef useRGBLed
 void testblink(){
   led_strip_set_pixel(led_strip, 0, 16, 0, 0);
         /* Refresh the strip to send data */
@@ -231,6 +253,7 @@ void testblink(){
 
  led_strip_clear(led_strip);
 }
+#endif
 
 /*
 void watchdog_feed() {
@@ -251,6 +274,7 @@ void watchdog_feed_task(void *pvParameters) {
 }
 */
 
+#ifdef useRGBLed
 /**
  * @brief Helper function to print the contents of an led_state_t struct
  * 
@@ -356,8 +380,9 @@ void led_control_task_old(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
+#endif
 
-
+#ifdef useAccelerometer
 #define MPU9250_I2C_ADDRESS 0x68
 
 
@@ -381,6 +406,9 @@ QueueHandle_t mpu_data_queue;
 // 0.98 is a common starting point for responsive yet stable tracking.
 #define COMPLEMENTARY_FILTER_ALPHA 0.98f
 
+#endif
+
+#ifdef useAccelerometer
 /**
  * @brief FreeRTOS task to read MPU9250 sensor data and calculate a stable
  *        orientation using a complementary filter.
@@ -486,12 +514,14 @@ void mpu9250_reader_task(void *pvParameters)
     
      
 }
- 
+#endif
 
+#ifdef useAccelerometer
 /**
  * @brief Example task that waits for and processes MPU9250 data from the queue.
  *        This task demonstrates how to correctly access the fused orientation data.
  */
+
 void data_processor_task(void *pvParameters)
 {
     mpu_data_t received_data;
@@ -510,7 +540,9 @@ void data_processor_task(void *pvParameters)
 
     }
 }
+#endif
 
+#ifdef useRGBLed
 void rgb_led_init() {
     ESP_LOGI("LED_INIT", "Initializing WS2812 LED strip...");
     
@@ -702,7 +734,7 @@ void rgb_led_constant(LedColor color, float strength_val) {
  //    }
  }
  
-
+#endif
 
 
 
@@ -1054,7 +1086,9 @@ if (xSemaphoreTake(g_i2c_bus_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
 
     while(1) {
 
-if (useAcc){
+
+#ifdef useAccelerometer
+
        if (xQueueReceive(mpu_data_queue, &current_orientation, 0) == pdPASS) {
             // New orientation data is now stored in 'current_orientation'
         }
@@ -1070,7 +1104,7 @@ if (useAcc){
                  // Device is relatively level, use default logic
             }
 
-        }
+#endif
 
 
 bool topAlert = false;
@@ -1150,7 +1184,7 @@ update_beeper_alerts(alert_level_average);
  //           led_state_t desired_led_state{};
             const alert_config_t *config = &alert_configs[alert_level_average];
     
-
+#ifdef useRGBLed
  // --- NEW: Create and populate a single, simple LED state object ---
     led_state_t desired_led_state{}; // Zero-initialize
 
@@ -1193,7 +1227,7 @@ ESP_LOGI(TAG, "LED trying manual light %d %d %d %u", desired_led_state.r, desire
 
 ESP_LOGI(TAG, "LED state no change detected");
      }
-
+#endif
 
                 // Print grid visualization
                 for (int row = 0; row <= 3; row++) {
@@ -1256,7 +1290,7 @@ ESP_LOGI(TAG, "LED state no change detected");
                 ESP_LOGE(TAG, "Not ready threshold reached. Attempting recovery...");
 
                    xSemaphoreGive(g_i2c_bus_mutex);
-                   
+
                 // Call the new, comprehensive recovery function
                 if (vl53l5cx_recover(Dev)) {
                     // Recovery was successful, reset the counter and continue.
@@ -1364,8 +1398,6 @@ extern "C" void app_main(void)
         .idle_core_mask = (1 << CONFIG_FREERTOS_NUMBER_OF_CORES) - 1,    // Bitmask of all cores
         .trigger_panic = false,
     };
-    //ESP_ERROR_CHECK(esp_task_wdt_init(&twdt_config));
-    //printf("TWDT initialized\n");
 
 gpio_set_direction(RED_PIN, GPIO_MODE_OUTPUT);
 gpio_set_direction(BLUE_PIN, GPIO_MODE_OUTPUT);
@@ -1381,7 +1413,6 @@ gpio_set_direction(GREEN_PIN_1, GPIO_MODE_OUTPUT);
 gpio_set_level(RED_PIN_1, 0); 
 gpio_set_level(BLUE_PIN_1, 0);  
 gpio_set_level(GREEN_PIN_1, 0); 
-
 
 
     uint32_t last_sensor_read = 0;
@@ -1403,13 +1434,14 @@ gpio_set_level(GREEN_PIN_1, 0);
     i2c_master_bus_handle_t bus_handle;
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &bus_handle));
 
-
+#ifdef useRGBLed
     // Create the mutex to protect the LED strip driver
     led_strip_mutex = xSemaphoreCreateMutex();
     if (led_strip_mutex == NULL) {
         ESP_LOGE("MAIN", "Failed to create LED strip mutex!");
         return; // Cannot continue
     }
+#endif
 
         g_i2c_bus_mutex = xSemaphoreCreateMutex();
     if (g_i2c_bus_mutex == NULL) {
@@ -1417,25 +1449,30 @@ gpio_set_level(GREEN_PIN_1, 0);
         return;
     }
 
-mpu_data_queue = xQueueCreate(5, sizeof(mpu_data_t));
+#ifdef useAccelerometer
+        mpu_data_queue = xQueueCreate(5, sizeof(mpu_data_t));
+#endif
+
 led_state_queue = xQueueCreate(1, sizeof(led_state_t)); // Correct queue
-    ESP_LOGI("MAIN", "Mutex and Queues created.");
+ESP_LOGI("MAIN", "Mutex and Queues created.");
 
-
+#ifdef useRGBLed
 configure_led();
+#endif
+
 //rgb_led_init();
 vTaskDelay(pdMS_TO_TICKS(100));
-//testblink();
 
-    // 3. Try to set the LED to solid red
-    ESP_LOGI("MINIMAL_TEST", "Attempting to set LED to RED 50%.");
+#ifdef useRGBLed
+
+    // 3. Try to set the LED as testto RED 50%.");
         rgb_led_set_color_with_brightness(255, 0, 0, 0.5); // 50% brightness red
  vTaskDelay(pdMS_TO_TICKS(500));
     rgb_led_set_color_with_brightness(0, 255, 0, 0.5); // 50% brightness red
  vTaskDelay(pdMS_TO_TICKS(500));
     rgb_led_set_color_with_brightness(0, 0, 255, 0.5); // 50% brightness red
  vTaskDelay(pdMS_TO_TICKS(500));
-
+#endif
 
    // Initialize piezo beeper
     esp_err_t ret = init_piezo_beeper();
@@ -1444,7 +1481,6 @@ vTaskDelay(pdMS_TO_TICKS(100));
         return;
     }
    ESP_LOGI(TAG, "initialized piezo beeper");
-
 
 // --- 1. Declare necessary variables ---
 uint8_t status, isAlive;
@@ -1489,9 +1525,8 @@ if (status) {
 
 ESP_LOGI(TAG, "VL53L5CX ULD ready! (Version: %s)", VL53L5CX_API_REVISION);
 
+#ifdef useAccelerometer
 
-
-//// add gyro
 // --- MPU9250 Initialization ---
     i2c_master_dev_handle_t mpu9250_dev_handle;
     i2c_device_config_t mpu9250_dev_cfg = {
@@ -1500,7 +1535,6 @@ ESP_LOGI(TAG, "VL53L5CX ULD ready! (Version: %s)", VL53L5CX_API_REVISION);
         .scl_speed_hz = 100000,
     };
 
-    if (useAcc){
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &mpu9250_dev_cfg, &mpu9250_dev_handle));
     ESP_LOGI("I2C", "Device MPU9250 added to bus");
     
@@ -1517,32 +1551,12 @@ ESP_LOGI(TAG, "VL53L5CX ULD ready! (Version: %s)", VL53L5CX_API_REVISION);
 
 
     vTaskDelay(pdMS_TO_TICKS(100)); // Wait for the sensor to stabilize
-}
 
-    // The created tasks will run in the background.
+#endif
+
     ESP_LOGI("MAIN", "Initialization complete. Tasks are running.");
 
-   
-    // Boot beeps
-    for (int i = 0; i < 3; i++) {
-        set_beeper_tone(1000, true);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        set_beeper_tone(0, false);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-  
-
  
-    // Static arrays for grid layout and alerts
-    static const uint8_t gridLayout[4][4] = {
-        {0, 1, 2, 3},
-        {4, 5, 6, 7},
-        {8, 9, 10, 11},
-        {12, 13, 14, 15}
-    };
-    static alert_level_t gridAlerts[16];
-
     // Prepare task parameters
     static sensor_task_params_t task_params = {
         .dev = &Dev,
@@ -1553,27 +1567,20 @@ ESP_LOGI(TAG, "VL53L5CX ULD ready! (Version: %s)", VL53L5CX_API_REVISION);
  // --- 5. Create and Launch All Tasks ---
     ESP_LOGI("MAIN", "Creating tasks...");
 
+    #ifdef useRGBLed
+    ESP_LOGI("MAIN", "Creating task for RGB LED");
     // Create the LED task. It's now safe to start.
     xTaskCreate(led_control_task, "LED Control", 4096, NULL, 4, NULL);
+#endif
 
     // Create sensor and data processing tasks
-    if (useAcc){
+#ifdef useAccelerometer
+ESP_LOGI("MAIN", "Creating task for Accelerometer");
     xTaskCreate(mpu9250_reader_task, "MPU Reader", 4096, mpu9250_dev_handle, 5, NULL);
-    }
+#endif
+
     xTaskCreate(data_processor_task, "Data Processor", 4096, NULL, 3, NULL);
     xTaskCreate(vl53l5cx_reader_task, "VL53L5CX Reader", 8192, &task_params, 5, NULL);
 
-// --- 6. Perform Startup Indications ---
-    // (Optional, can be removed)
-    ESP_LOGI("MAIN", "Performing boot indication...");
-    for (int i = 0; i < 3; i++) {
-        set_beeper_tone(1000, true);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        set_beeper_tone(0, false);
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
 
- 
-    // app_main can now return, letting the task run
-    // The task will continue running independently
 }
