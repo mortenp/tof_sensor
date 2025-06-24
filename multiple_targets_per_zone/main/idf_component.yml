@@ -1,0 +1,7 @@
+dependencies:
+  rjrp44/vl53l5cx:
+    version: ~4.0.0
+  espressif/led_strip: ^3.0.1
+  truita/mpu9250: ^1.0.1
+description: VL53L5CX multiples targets per zone example
+version: 1.0.0
