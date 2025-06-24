@@ -31,7 +31,7 @@
 
  // gyro
  #include <mpu9250.h>
-#include <math.h> // For atan2f and sqrtf
+ #include <math.h> // For atan2f and sqrtf
 
 // --- Alert Level Types ---
 typedef enum {
@@ -173,17 +173,17 @@ static led_strip_handle_t led_strip = NULL;
 #define BEEP_DUTY_CYCLE         512  // 50% duty cycle for clear tone
 
 //static bool useAcc = 0;
-//#define  useAccelerometer 0
-#undef useAccelerometer
+#define  useAccelerometer 1
+//#undef useAccelerometer
 #undef useRGBLed
 
 
- int ALERT_IMMEDIATE_LIMIT = 40;
+ int ALERT_IMMEDIATE_LIMIT = 50;
   int ALERT_CLOSE_LIMIT  = 80;
-  int ALERT_MEDIUM_LIMIT  = 100;
-   int ALERT_MEDIUMFAR_LIMIT  = 140;
-  int ALERT_FAR_LIMIT  = 200;
-    int ALERT_VERYFAR_LIMIT  = 300;
+  int ALERT_MEDIUM_LIMIT  = 120;
+   int ALERT_MEDIUMFAR_LIMIT  = 150;
+  int ALERT_FAR_LIMIT  = 170;
+    int ALERT_VERYFAR_LIMIT  = 210;
 #define HYSTERESIS 15  // cm
 
    // Static arrays for grid layout and alerts
@@ -424,6 +424,7 @@ void mpu9250_reader_task(void *pvParameters)
     uint32_t last_update_time = xTaskGetTickCount();
 
     ESP_LOGI("MPU9250_TASK", "Fusion task started.");
+   vTaskDelay(pdMS_TO_TICKS(100));
 
     while (1)
     {
@@ -431,10 +432,10 @@ void mpu9250_reader_task(void *pvParameters)
         float dt = (float)(current_time - last_update_time) / (float)configTICK_RATE_HZ;
         last_update_time = current_time;
  
-        
+  vTaskDelay(pdMS_TO_TICKS(200));
+      
            if (xSemaphoreTake(g_i2c_bus_mutex, portMAX_DELAY) == pdTRUE) {
             
-
 
         esp_err_t err = i2c_master_transmit_receive(
             mpu9250_dev_handle,
@@ -494,18 +495,18 @@ void mpu9250_reader_task(void *pvParameters)
         sensor_data.accel_y_g * sensor_data.accel_y_g +
         sensor_data.accel_z_g * sensor_data.accel_z_g
     );
-
+ESP_LOGD("MPU9250_TASK", "total_accel_magnitude: %f", total_accel_magnitude);
 // When the device is still, magnitude should be ~1.0. During free-fall, it's ~0.0.
-    if (total_accel_magnitude < 0.2) { // Threshold for detecting free-fall
-        ESP_LOGW("FALL_DETECT", "FREE-FALL DETECTED! Magnitude: %.2f g", total_accel_magnitude);
+    if (total_accel_magnitude > 1.3) { // Threshold for detecting free-fall
+        ESP_LOGI("FALL_DETECT", "FREE-FALL DETECTED! Magnitude: %.2f g", total_accel_magnitude);
+ // vTaskDelay(pdMS_TO_TICKS(1000));
+
     // You could trigger an alert here or set a flag for another task to see.
     }
 
                   // ALWAYS give the mutex back
             xSemaphoreGive(g_i2c_bus_mutex);
 
-
- vTaskDelay(pdMS_TO_TICKS(300));
       
     }
 
@@ -532,8 +533,38 @@ void data_processor_task(void *pvParameters)
         // Wait indefinitely until an item is available on the queue.
         if (xQueueReceive(mpu_data_queue, &received_data, portMAX_DELAY) == pdPASS)
         {
+
+/*
+         straight    Pitch: -25.00°, Roll: 159.13° 
+          up   Pitch: -48.69°, Roll: 124.07°
+        down Pitch: -53.90°, Roll: 179.25°
+        lean right: Pitch: -14.88°, Roll: 186.32°
+        lean left: Pitch: -40.04°, Roll: 130.50°
+turn right: Pitch: -38.04°, Roll: 161.72°
+turn left: Pitch: -68.80°, Roll: 162.69°
+*/
+
+
+/*
+if (received_data.pitch < -50 ){
+    ESP_LOGI("ACCEL", "LEFT");
+}
+
+if (received_data.pitch < -40 ){
+    ESP_LOGI("ACCEL", "UP");
+}
+
+
+if (received_data.roll > 130 ){
+    ESP_LOGI("ACCEL", "lean right");
+}
+if (received_data.roll > 170 ){
+    ESP_LOGI("ACCEL", "lean right");
+}
+*/
+
             // --- FUSED ORIENTATION DATA (Most Important Output) ---
-            ESP_LOGI("PROCESSOR_TASK", "Orientation -> Pitch: %.2f°, Roll: %.2f°", received_data.pitch, received_data.roll);
+           ESP_LOGD("PROCESSOR_TASK", "Orientation -> Pitch: %.2f°, Roll: %.2f°", received_data.pitch, received_data.roll);
         }
  vTaskDelay(pdMS_TO_TICKS(300));
 
@@ -1030,7 +1061,7 @@ void vl53l5cx_reader_task(void *pvParameters) {
     uint8_t status, isReady, i;
     VL53L5CX_ResultsData Results;
     uint32_t last_sensor_read = 0;
-    const uint32_t SENSOR_READ_INTERVAL = 200; // 1ms
+    const uint32_t SENSOR_READ_INTERVAL = 600; // 1ms
     int loop = 0;
     uint16_t primary_distance_total = 0;
 
@@ -1069,18 +1100,19 @@ static led_state_t last_sent_led_state{};
     // Start ranging
  //   status = vl53l5cx_start_ranging(Dev);
 
+vTaskDelay(pdMS_TO_TICKS(200));
 
 if (xSemaphoreTake(g_i2c_bus_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
   
         status = vl53l5cx_start_ranging(Dev);
 
-
+vTaskDelay(pdMS_TO_TICKS(500));
 
     if (status) {
         ESP_LOGE(TAG, "Failed to start ranging");
-         xSemaphoreGive(g_i2c_bus_mutex);
+        xSemaphoreGive(g_i2c_bus_mutex);
         vTaskDelete(NULL);
-    //    return;
+       return;
     }
 
 
@@ -1093,16 +1125,28 @@ if (xSemaphoreTake(g_i2c_bus_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             // New orientation data is now stored in 'current_orientation'
         }
 
-
-            if (current_orientation.pitch > 45.0) {
-                 ESP_LOGI("VL53_TASK", "Device is pointed UPWARDS (Pitch: %.1f). Adjusting logic.", current_orientation.pitch);
+/*
+            if (current_orientation.pitch > 50.0) {
+                 ESP_LOGI("VL53_TASK", "Device is pointed RIGHT (Pitch: %.1f). Adjusting logic.", current_orientation.pitch);
                  // e.g., Treat the top row of the sensor as the "forward" direction
-            } else if (current_orientation.pitch < -45.0) {
-                 ESP_LOGI("VL53_TASK", "Device is pointed DOWNWARDS (Pitch: %.1f). Ignoring floor.", current_orientation.pitch);
+            } else if (current_orientation.pitch < -40.0) {
+                 ESP_LOGI("VL53_TASK", "Device is pointed LEFT (Pitch: %.1f). Ignoring floor.", current_orientation.pitch);
                  // e.g., Filter out readings from the bottom rows
             } else {
                  // Device is relatively level, use default logic
             }
+
+
+            if (current_orientation.roll > 140) {
+                ESP_LOGI("VL53_TASK", "Device is pointed DOWN (Pitch: %.1f). Adjusting logic.", current_orientation.pitch);
+                 // e.g., Treat the top row of the sensor as the "forward" direction
+            } else if (current_orientation.roll < 100) {
+                ESP_LOGI("VL53_TASK", "Device is pointed UP (Pitch: %.1f). Ignoring floor.", current_orientation.pitch);
+                 // e.g., Filter out readings from the bottom rows
+            } else {
+                 // Device is relatively level, use default logic
+            }
+*/
 
 #endif
 
@@ -1115,16 +1159,18 @@ bool bottomAlert = false;
         if (current_time - last_sensor_read >= SENSOR_READ_INTERVAL) {
             last_sensor_read = current_time;
 
+         //   vTaskDelay(pdMS_TO_TICKS(100));
             status = vl53l5cx_check_data_ready(Dev, &isReady);
 
-ESP_LOGI(TAG, "Sensor task started");
-ESP_LOGI(TAG, "Status: %d %d", status, isReady);
+//ESP_LOGD(TAG, "Sensor task started");
+ESP_LOGD(TAG, "Status: %d %d", status, isReady);
 
 
             if(isReady) {
 
+            
   not_ready_count = 0; // Reset counter on success
-
+                vTaskDelay(pdMS_TO_TICKS(100));
                 vl53l5cx_get_ranging_data(Dev, &Results);
 
                 primary_distance_total = 0;
@@ -1310,7 +1356,7 @@ ESP_LOGI(TAG, "LED state no change detected");
             if (not_ready_count >= NOT_READY_THRESHOLD) {
                 ESP_LOGE(TAG, "Not ready threshold reached. Attempting recovery...");
 
-                   xSemaphoreGive(g_i2c_bus_mutex);
+                 xSemaphoreGive(g_i2c_bus_mutex);
 
                 // Call the new, comprehensive recovery function
                 if (vl53l5cx_recover(Dev)) {
@@ -1327,7 +1373,7 @@ ESP_LOGI(TAG, "LED state no change detected");
             }
 
             }
-VL53L5CX_WaitMs(&(Dev->platform), 5);
+VL53L5CX_WaitMs(&(Dev->platform), 20);
             // printf("-------------------\n");
         } // SENSOR_READ_INTERVAL passed
            // Periodic Stack Check (e.g., every 10 iterations)
@@ -1351,16 +1397,16 @@ VL53L5CX_WaitMs(&(Dev->platform), 5);
 //esp_task_wdt_feed();
 
      } // while 1 loop end
-
+   xSemaphoreGive(g_i2c_bus_mutex);
     } //  got mutex
         else {
         ESP_LOGW(TAG, "No mutext");
-        xSemaphoreGive(g_i2c_bus_mutex);
+    //    xSemaphoreGive(g_i2c_bus_mutex);
         }
 
     // Cleanup (though this won't be reached in normal operation)
     vl53l5cx_stop_ranging(Dev);
-     xSemaphoreGive(g_i2c_bus_mutex);
+  
     set_beeper_tone(0, false);
     vTaskDelete(NULL);
 }
