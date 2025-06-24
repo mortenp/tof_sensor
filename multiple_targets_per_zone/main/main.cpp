@@ -21,6 +21,7 @@
  #include "esp_task_wdt.h"
  #define WATCHDOG_TIMEOUT_SEC 5  // Reset if no feed within 10 seconds
 
+/// #include "blink_task.h"
  
 ////// LED
  #include "led_strip.h"
@@ -28,6 +29,50 @@
  #include "math.h"
 
  #include "driver/gpio.h"
+
+ // vibration
+ //#include "vibramotor.h"
+//#include <driver/pwm.h>
+#define LEDC_GPIO 39
+//#define  LEDC_OUTPUT_IO 39
+#define SAMPLE_CNT 32
+
+
+#define LEDC_TIMER              LEDC_TIMER_0
+#define LEDC_MODE               LEDC_LOW_SPEED_MODE
+#define LEDC_OUTPUT_IO          (39) // Define the output GPIO
+#define LEDC_CHANNEL            LEDC_CHANNEL_0
+#define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
+#define LEDC_DUTY               (4096) // Set duty to 50%. (2 ** 13) * 50% = 4096
+#define LEDC_FREQUENCY          (5) // Frequency in Hertz. Set frequency at 4 kHz
+
+
+static void example_ledc_init(void)
+{
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer = {
+   //     .speed_mode       = LEDC_MODE,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .timer_num        = LEDC_TIMER,
+        .freq_hz          = LEDC_FREQUENCY,  // Set output frequency at 4 kHz
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+//       .intr_type      = LEDC_INTR_DISABLE,
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel = {
+         .gpio_num       = LEDC_OUTPUT_IO,
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_CHANNEL,
+        .timer_sel      = LEDC_TIMER,
+  
+       
+        .duty           = 0, // Set duty to 0%
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+}
 
  // gyro
  #include <mpu9250.h>
@@ -150,13 +195,16 @@ static const alert_config_t alert_configs[] = {
 #define BLUE_PIN_1  GPIO_NUM_36
 #define GREEN_PIN_1  GPIO_NUM_37
 
+// Define GPIO pin number
+#define BLINK_PIN GPIO_NUM_35
 
- #define WS2812_GPIO         48
- #define WS2812_LED_COUNT     1
+
+// #define WS2812_GPIO         48
+// #define WS2812_LED_COUNT     1
  
 static const char *TAG = "WALKING_AID";
 
-static led_strip_handle_t led_strip = NULL;
+//static led_strip_handle_t led_strip = NULL;
 // Piezo beeper pin
 #define PIEZO_BEEPER_PIN        GPIO_NUM_38   // PWM pin for piezo beeper
 
@@ -179,11 +227,11 @@ static led_strip_handle_t led_strip = NULL;
 
 
  int ALERT_IMMEDIATE_LIMIT = 50;
-  int ALERT_CLOSE_LIMIT  = 80;
-  int ALERT_MEDIUM_LIMIT  = 120;
+  int ALERT_CLOSE_LIMIT  = 90;
+  int ALERT_MEDIUM_LIMIT  = 130;
    int ALERT_MEDIUMFAR_LIMIT  = 150;
-  int ALERT_FAR_LIMIT  = 170;
-    int ALERT_VERYFAR_LIMIT  = 210;
+  int ALERT_FAR_LIMIT  = 160;
+    int ALERT_VERYFAR_LIMIT  = 180;
 #define HYSTERESIS 15  // cm
 
    // Static arrays for grid layout and alerts
@@ -232,8 +280,13 @@ void mpu9250_reader_task(void *pvParameters);
 void data_processor_task(void *pvParameters);
 #endif
 
+
 void vl53l5cx_reader_task(void *pvParameters);
 bool vl53l5cx_recover(VL53L5CX_Configuration *dev);
+
+//void blink_task(void *pvParameters);
+// Task prototype
+//void blink_task_init(gpio_num_t pin, uint8_t times, uint8_t interval_ms);
 
 #ifdef useRGBLed
 void testblink(){
@@ -382,6 +435,44 @@ void led_control_task_old(void *pvParameters)
 }
 #endif
 
+
+
+// Task parameters structure (for potential future expansion)
+typedef struct {
+    gpio_num_t pin;
+    uint8_t times;
+    uint8_t interval_ms;
+} blink_task_params_t;
+
+// Static storage for task parameters
+static blink_task_params_t blink_task_params;
+
+// **Embedded Blink Task Function**
+static void blink_task(void *pvParameter) {
+    // Configure GPIO pin as output
+ //   gpio_pad_select_gpio(BLINK_PIN);
+    gpio_set_direction(blink_task_params.pin, GPIO_MODE_OUTPUT);
+
+    // Blink 'times' times with 'interval_ms' between blinks
+    for (uint8_t i = 0; i < blink_task_params.times; i++) {
+        gpio_set_level(blink_task_params.pin, 1);
+        vTaskDelay(pdMS_TO_TICKS(blink_task_params.interval_ms / 2));
+        gpio_set_level(blink_task_params.pin, 0);
+        vTaskDelay(pdMS_TO_TICKS(blink_task_params.interval_ms - (blink_task_params.interval_ms / 2)));
+    }
+    gpio_set_level(blink_task_params.pin, 0); // Final state
+    vTaskDelete(NULL);
+}
+
+// **Embedded Function to Initialize Blink Task**
+static void blink_task_init( gpio_num_t pin, uint8_t times, uint8_t interval_ms) {
+    blink_task_params.pin = pin;
+    blink_task_params.times = times;
+    blink_task_params.interval_ms = interval_ms;
+    xTaskCreate(blink_task, "BlinkTask", 1024, NULL, 2, NULL);
+}
+
+
 #ifdef useAccelerometer
 #define MPU9250_I2C_ADDRESS 0x68
 
@@ -499,6 +590,10 @@ ESP_LOGD("MPU9250_TASK", "total_accel_magnitude: %f", total_accel_magnitude);
 // When the device is still, magnitude should be ~1.0. During free-fall, it's ~0.0.
     if (total_accel_magnitude > 1.3) { // Threshold for detecting free-fall
         ESP_LOGI("FALL_DETECT", "FREE-FALL DETECTED! Magnitude: %.2f g", total_accel_magnitude);
+ //   blink_task_init(GPIO_NUM_35, 2, 500); // 
+ blink_task_init(GPIO_NUM_36, 5, 500); // 
+//  blink_task_init(GPIO_NUM_37, 2, 500); // 
+
  // vTaskDelay(pdMS_TO_TICKS(1000));
 
     // You could trigger an alert here or set a flag for another task to see.
@@ -572,6 +667,8 @@ if (received_data.roll > 170 ){
     }
 }
 #endif
+
+
 
 #ifdef useRGBLed
 void rgb_led_init() {
@@ -854,22 +951,37 @@ void update_beeper_alerts(alert_level_t new_level) {
             set_beeper_tone(0, false);
             beeper.is_beeping = false;
         }
+
+gpio_set_level(RED_PIN_1, 0); 
+gpio_set_level(BLUE_PIN_1, 0);  
+gpio_set_level(GREEN_PIN_1, 0); 
+
+
+
         return;
     } else {
 
  ESP_LOGI(TAG, "new_level %d", new_level);
 
+gpio_set_level(RED_PIN_1, 0); 
+gpio_set_level(BLUE_PIN_1, 0);  
+gpio_set_level(GREEN_PIN_1, 0); 
+
+
        if (new_level ==6){
-gpio_set_level(RED_PIN_1, 1); 
+blink_task_init(RED_PIN_1, 5, 500); // 
+
+//gpio_set_level(RED_PIN_1, 1); 
 gpio_set_level(BLUE_PIN_1, 0);  
 gpio_set_level(GREEN_PIN_1, 0); 
         }
        if (new_level ==5){
 gpio_set_level(RED_PIN_1, 1); 
-gpio_set_level(BLUE_PIN_1, 1);  
+gpio_set_level(BLUE_PIN_1, 0);  
 gpio_set_level(GREEN_PIN_1, 0); 
         }
 if (new_level ==4 ){
+ //   blink_task_init(BLUE_PIN_1, 5, 500); // 
 gpio_set_level(RED_PIN_1, 0); 
 gpio_set_level(BLUE_PIN_1, 1);  
 gpio_set_level(GREEN_PIN_1, 0); 
@@ -1153,6 +1265,7 @@ vTaskDelay(pdMS_TO_TICKS(500));
 
 bool topAlert = false;
 bool bottomAlert = false;
+int centreAlert = 0;
 
         uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
         
@@ -1193,7 +1306,7 @@ ESP_LOGD(TAG, "Status: %d %d", status, isReady);
 
 if ((i % 4) == 0) {
 
-     if( gridAlerts[i] > 3  ){
+     if( primary_distance <= ALERT_CLOSE_LIMIT   ){
         topAlert = true;
      }
 
@@ -1202,7 +1315,7 @@ if ((i % 4) == 0) {
 
 
 if ((i % 4) == 3) {
- if( gridAlerts[i] > 3 ){ 
+ if( primary_distance <= ALERT_CLOSE_LIMIT ){ 
 bottomAlert = true;
  }
 }
@@ -1212,6 +1325,13 @@ uint8_t remainder = i % 4;
 if (remainder == 1 || remainder == 2) {
     // 'i' is in gridCentre.
      primary_distance_total += primary_distance;
+
+if(primary_distance <= ALERT_CLOSE_LIMIT){
+    ESP_LOGI(TAG, "centreAlert:%d dist:%d", gridAlerts[i], primary_distance);
+
+    centreAlert ++;
+}
+
 }
 
 
@@ -1227,7 +1347,13 @@ if (remainder == 1 || remainder == 2) {
 
 
 ESP_LOGI(TAG, "average tot:%d avg:%d", primary_distance_total, average_distance);
+
+if (centreAlert > 2){
+update_beeper_alerts(alert_level_t::ALERT_CLOSE);
+centreAlert = 0;
+} else {
 update_beeper_alerts(alert_level_average);
+}
 
 gpio_set_level(RED_PIN, 0); 
 gpio_set_level(BLUE_PIN, 0);  
@@ -1654,8 +1780,73 @@ ESP_LOGI("MAIN", "Creating task for Accelerometer");
     xTaskCreate(data_processor_task, "Data Processor", 4096, NULL, 3, NULL);
     #endif
 
+// Static storage for task parameters
+//static blink_task_params_t task_params;
 
     xTaskCreate(vl53l5cx_reader_task, "VL53L5CX Reader", 8192, &task_params, 5, NULL);
 
+///// vibration
+
+//for (int i = 0; i < SAMPLE_CNT; ++i)
+ 
+ example_ledc_init();
+uint32_t duty = 8000;
+int count = 0;
+
+       while (count < 10)
+    {
+    
+   // LEDC_DUTY = 2000;
+
+    //#define LEDC_DUTY               (4096) // Set duty to 50%. (2 ** 13) * 50% = 4096
+    // Set duty to 50%
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty));
+    // Update duty to apply the new value
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+ vTaskDelay(1000 / portTICK_PERIOD_MS);
+ duty += 100;
+        count++;
+    }
+
+
+/*
+
+    pwm_config_t config = {
+        .period = 1000000 / PWM_VIBRATION_MOTOR_FREQ,  // Period in microseconds
+        .duty = PWM_VIBRATION_MOTOR_DUTY_MIN,          // Initial duty cycle
+        .delay = 0,                                  // Delay in microseconds (not used here)
+        .mode = PWM_MODE革命_SIM,                    //Cumulative mode for standard PWM
+        .s_q = 0,                                    // No queue (direct allocation)
+    };
+
+    // **Set GPIO as PWM output**
+    gpio_pad_select_gpio(PWM_VIBRATION_MOTOR_GPIO);
+    gpio_set_direction(PWM_VIBRATION_MOTOR_GPIO, GPIO_MODE_OUTPUT);
+    
+    // **Initialize and start PWM**
+    esp_err_t err = pwm_init(&config, PWM_VIBRATION_MOTOR_CHAN, PWM_VIBRATION_MOTOR_GPIO);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "PWM Init failed: 0x%x", err);
+        return;
+    }
+    pwm_start(PWM_VIBRATION_MOTOR_CHAN);
+
+    // **Example: Set duty cycle to 50% (adjust as needed)**
+    pwm_set_duty(PWM_VIBRATION_MOTOR_CHAN, 127); // 50% duty cycle
+    pwm_set_frequency(PWM_VIBRATION_MOTOR_CHAN, PWM_VIBRATION_MOTOR_FREQ);
+int count = 0;
+       while (count < 5) {
+        // **SIMPLE DEMO: Toggle between 25%, 50%, and 75% duty cycles every 500ms**
+        static uint8_t duty[] = {64, 127, 191}; // 25%, 50%, 75%
+        static uint8_t index = 0;
+        pwm_set_duty(PWM_VIBRATION_MOTOR_CHAN, duty[index]);
+        index = (index + 1) % 3; // Cycle through duty array
+        vTaskDelay(pdMS_TO_TICKS(500));
+        count++;
+    }
+
+*/
+
+// blink_task_init(5, 500); // Blink 5 times with 500 ms interval
 
 }
