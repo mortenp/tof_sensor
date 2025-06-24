@@ -1030,7 +1030,7 @@ void vl53l5cx_reader_task(void *pvParameters) {
     uint8_t status, isReady, i;
     VL53L5CX_ResultsData Results;
     uint32_t last_sensor_read = 0;
-    const uint32_t SENSOR_READ_INTERVAL = 50; // 1ms
+    const uint32_t SENSOR_READ_INTERVAL = 200; // 1ms
     int loop = 0;
     uint16_t primary_distance_total = 0;
 
@@ -1072,17 +1072,17 @@ static led_state_t last_sent_led_state{};
 
 if (xSemaphoreTake(g_i2c_bus_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
   
-         status = vl53l5cx_check_data_ready(Dev, &isReady);
+        status = vl53l5cx_start_ranging(Dev);
 
 
 
     if (status) {
         ESP_LOGE(TAG, "Failed to start ranging");
+         xSemaphoreGive(g_i2c_bus_mutex);
         vTaskDelete(NULL);
-        return;
+    //    return;
     }
 
-    ESP_LOGI(TAG, "Sensor task started successfully");
 
     while(1) {
 
@@ -1115,7 +1115,11 @@ bool bottomAlert = false;
         if (current_time - last_sensor_read >= SENSOR_READ_INTERVAL) {
             last_sensor_read = current_time;
 
-   
+            status = vl53l5cx_check_data_ready(Dev, &isReady);
+
+ESP_LOGI(TAG, "Sensor task started");
+ESP_LOGI(TAG, "Status: %d %d", status, isReady);
+
 
             if(isReady) {
 
@@ -1179,6 +1183,23 @@ if (remainder == 1 || remainder == 2) {
 ESP_LOGI(TAG, "average tot:%d avg:%d", primary_distance_total, average_distance);
 update_beeper_alerts(alert_level_average);
 
+gpio_set_level(RED_PIN, 0); 
+gpio_set_level(BLUE_PIN, 0);  
+gpio_set_level(GREEN_PIN, 0); 
+
+      if (topAlert){
+gpio_set_level(RED_PIN, 0); 
+gpio_set_level(BLUE_PIN, 1);  
+gpio_set_level(GREEN_PIN, 0); 
+        }
+       if (bottomAlert){
+gpio_set_level(RED_PIN, 1); 
+gpio_set_level(BLUE_PIN, 0);  
+gpio_set_level(GREEN_PIN, 0); 
+        }
+      if (!bottomAlert && !topAlert){
+
+      }
 
             // --- Create and populate a single LED state object ---
  //           led_state_t desired_led_state{};
@@ -1331,10 +1352,15 @@ VL53L5CX_WaitMs(&(Dev->platform), 5);
 
      } // while 1 loop end
 
-    } // while 1 loop end
+    } //  got mutex
+        else {
+        ESP_LOGW(TAG, "No mutext");
+        xSemaphoreGive(g_i2c_bus_mutex);
+        }
 
     // Cleanup (though this won't be reached in normal operation)
     vl53l5cx_stop_ranging(Dev);
+     xSemaphoreGive(g_i2c_bus_mutex);
     set_beeper_tone(0, false);
     vTaskDelete(NULL);
 }
@@ -1582,7 +1608,7 @@ ESP_LOGI("MAIN", "Creating task for Accelerometer");
     xTaskCreate(data_processor_task, "Data Processor", 4096, NULL, 3, NULL);
     #endif
 
-    
+
     xTaskCreate(vl53l5cx_reader_task, "VL53L5CX Reader", 8192, &task_params, 5, NULL);
 
 
