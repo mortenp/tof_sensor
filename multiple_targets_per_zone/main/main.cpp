@@ -19,7 +19,7 @@
 #include "driver/i2c_slave.h"
 
  #include "esp_task_wdt.h"
- #define WATCHDOG_TIMEOUT_SEC 5  // Reset if no feed within 10 seconds
+ #define WATCHDOG_TIMEOUT_MSEC 20  // Reset if no feed within 10 milliseconds
 
 /// #include "blink_task.h"
  
@@ -30,6 +30,34 @@
 
  #include "driver/gpio.h"
 
+ //#include "vl53l1x.h"
+//#include "hcsr04_driver.h"
+#include <ultrasonic.h>
+
+#define TRIGGER_GPIO GPIO_NUM_17
+#define ECHO_GPIO GPIO_NUM_16
+#define MAX_DISTANCE_CM 400 // 5m max
+
+#define TRIGGER_GPIO_2 GPIO_NUM_3
+#define ECHO_GPIO_2 GPIO_NUM_8
+
+#include <gps.h>
+
+#include "nmea_example.h"
+#include "nmea.h"
+#include "gpgll.h"
+#include "gpgga.h"
+#include "gprmc.h"
+#include "gpgsa.h"
+#include "gpvtg.h"
+#include "gptxt.h"
+#include "gpgsv.h"
+
+#include "driver/uart.h"
+
+ #ifdef useVibrator
+
+ 
  // vibration
  //#include "vibramotor.h"
 //#include <driver/pwm.h>
@@ -73,6 +101,7 @@ static void example_ledc_init(void)
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 }
+#endif
 
  // gyro
  #include <mpu9250.h>
@@ -192,12 +221,35 @@ static const alert_config_t alert_configs[] = {
 #define GREEN_PIN  GPIO_NUM_45
 
 #define RED_PIN_1     GPIO_NUM_35
-#define BLUE_PIN_1  GPIO_NUM_36
+#define BLUE_PIN_1  GPIO_NUM_14
 #define GREEN_PIN_1  GPIO_NUM_37
 
 // Define GPIO pin number
-#define BLINK_PIN GPIO_NUM_35
+//#define BLINK_PIN GPIO_NUM_35
 
+#define centreAlert_WarnLevel 3
+
+#define acc_Move_limit 10
+static float last_pitch;
+static float last_roll;
+static bool vl53l5cx_running = false;
+static TaskHandle_t xHandle_mpu;
+static TaskHandle_t xHandle_mpu_processor;
+static TaskHandle_t xHandle_ultrasonic;
+static TaskHandle_t xHandle_ultrasonic_2;
+static TaskHandle_t xHandle_vl53l5cx;
+static TaskHandle_t xHandle_vibrator;
+static TaskHandle_t xHandle_blink;
+static TaskHandle_t xHandle_GPS;
+
+#define movement_timeout_msec 30
+static int last_movement = 0;
+// Define Notification Bits to act as commands
+#define START_BIT   (1 << 0) // Bit 0 for START command
+#define STOP_BIT    (1 << 1) // Bit 1 for STOP command
+
+bool vl53l5cx_hasMutex = false;
+bool mpu_hasMutex = false;
 
 // #define WS2812_GPIO         48
 // #define WS2812_LED_COUNT     1
@@ -207,6 +259,8 @@ static const char *TAG = "WALKING_AID";
 //static led_strip_handle_t led_strip = NULL;
 // Piezo beeper pin
 #define PIEZO_BEEPER_PIN        GPIO_NUM_38   // PWM pin for piezo beeper
+#define VIBRATORPIN GPIO_NUM_10
+#define VIBRATORPIN2 GPIO_NUM_11
 
 // Detection parameters
 #define MOVING_AVERAGE_WINDOW_SIZE  15
@@ -224,14 +278,51 @@ static const char *TAG = "WALKING_AID";
 #define  useAccelerometer 1
 //#undef useAccelerometer
 #undef useRGBLed
+#undef useVibrator
+#define useUltrasound 
+#undef useVl53l5cx
+#undef useUartA02YYUW
+#define useGPS
+#undef useGPS_2
+
+#undef  useUart 
+
+#define useVibrator2
+/*
+// vl53l1x ///
+static VL53L1_Dev_t dev;
+#define VLTAG "VL53L1X"
+VL53L1_Error status = VL53L1_ERROR_NONE;
+VL53L1_RangingMeasurementData_t rangingData;
+uint8_t dataReady = 0;
+uint16_t range;
+*/
+
+/// UART
+//#define RXD_PIN 16
+//#define TXD_PIN 17
+#define UART_NUM UART_NUM_1
+#define UART_BUFFER_SIZE (1024)
+#define UART_TIMEOUT_MS 20
+
+//#ifdef useGPS
+#define UART_GPS UART_NUM_2 
+#define UART_GPS_TXD GPIO_NUM_6 
+#define UART_GPS_RXD GPIO_NUM_7 
+//#endif
 
 
- int ALERT_IMMEDIATE_LIMIT = 50;
-  int ALERT_CLOSE_LIMIT  = 90;
-  int ALERT_MEDIUM_LIMIT  = 130;
+ int ALERT_IMMEDIATE_LIMIT = 40;
+  int ALERT_CLOSE_LIMIT  = 60;
+  int ALERT_MEDIUM_LIMIT  = 100;
    int ALERT_MEDIUMFAR_LIMIT  = 150;
-  int ALERT_FAR_LIMIT  = 160;
-    int ALERT_VERYFAR_LIMIT  = 180;
+  int ALERT_FAR_LIMIT  = 200;
+    int ALERT_VERYFAR_LIMIT  = 250;
+
+ 
+static uint16_t average_cm = 150;
+static uint16_t  total_average_cm = 150;
+
 #define HYSTERESIS 15  // cm
 
    // Static arrays for grid layout and alerts
@@ -248,7 +339,8 @@ static const char *TAG = "WALKING_AID";
 SemaphoreHandle_t led_strip_mutex;
 #endif
 SemaphoreHandle_t g_i2c_bus_mutex;
-
+SemaphoreHandle_t uart_mutex;
+SemaphoreHandle_t  ultrasound_mutex;
 // ----------------------------------------------------------------
 // --- NEW: Function Prototypes / Forward Declarations ---
 // ----------------------------------------------------------------
@@ -267,10 +359,12 @@ esp_err_t init_piezo_beeper(void);
 void set_beeper_tone(uint32_t frequency_hz, bool enable);
 
 // Alert logic functions
-alert_level_t get_alert_level(uint16_t distance_cm);
-void update_beeper_alerts(alert_level_t new_level);
+alert_level_t get_alert_level(uint16_t distance_cm, uint16_t measured_average_cm);
+void update_beeper_alerts(alert_level_t new_level, int direction);
 
 // Task functions
+extern "C" void read_and_parse_nmea();
+//extern "C" void nmea_example_init_interface(void);
 
 #ifdef useRGBLed
 void led_control_task(void *pvParameters);
@@ -435,13 +529,295 @@ void led_control_task_old(void *pvParameters)
 }
 #endif
 
+#ifdef useGPS_2
 
+#define UART_RX_BUF_SIZE 1024
+#define UART_RX_PIN 17
+
+static char s_buf[UART_RX_BUF_SIZE + 1];
+static size_t s_total_bytes;
+static char *s_last_buf_end;
+
+extern "C" void nmea_example_init_interface(void)
+{
+    uart_config_t uart_config = {
+        .baud_rate = 9600,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+        .source_clk = UART_SCLK_DEFAULT,
+#endif
+    };
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM,
+                                 UART_PIN_NO_CHANGE, UART_RX_PIN,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, UART_RX_BUF_SIZE * 2, 0, 0, NULL, 0));
+}
+
+void nmea_example_read_line(char **out_line_buf, size_t *out_line_len, int timeout_ms)
+{
+    *out_line_buf = NULL;
+    *out_line_len = 0;
+
+    if (s_last_buf_end != NULL) {
+        /* Data left at the end of the buffer after the last call;
+         * copy it to the beginning.
+         */
+        size_t len_remaining = s_total_bytes - (s_last_buf_end - s_buf);
+        memmove(s_buf, s_last_buf_end, len_remaining);
+        s_last_buf_end = NULL;
+        s_total_bytes = len_remaining;
+    }
+
+    /* Read data from the UART */
+    int read_bytes = uart_read_bytes(UART_NUM,
+                                     (uint8_t *) s_buf + s_total_bytes,
+                                     UART_RX_BUF_SIZE - s_total_bytes, pdMS_TO_TICKS(timeout_ms));
+    if (read_bytes <= 0) {
+        return;
+    }
+    s_total_bytes += read_bytes;
+
+    /* find start (a dollar sign) */
+    char *start = memchr(s_buf, '$', s_total_bytes);
+    if (start == NULL) {
+        s_total_bytes = 0;
+        return;
+    }
+
+    /* find end of line */
+    char *end = memchr(start, '\r', s_total_bytes - (start - s_buf));
+    if (end == NULL || *(++end) != '\n') {
+        return;
+    }
+    end++;
+
+    end[-2] = NMEA_END_CHAR_1;
+    end[-1] = NMEA_END_CHAR_2;
+
+    *out_line_buf = start;
+    *out_line_len = end - start;
+    if (end < s_buf + s_total_bytes) {
+        /* some data left at the end of the buffer, record its position until the next call */
+        s_last_buf_end = end;
+    } else {
+        s_total_bytes = 0;
+    }
+}
+
+
+extern "C" void read_and_parse_nmea()
+{
+    while (1) {
+        char fmt_buf[32];
+        nmea_s *data;
+
+        char *start;
+        size_t length;
+        nmea_example_read_line(&start, &length, 100 /* ms */);
+        if (length == 0) {
+            continue;
+        }
+
+        /* handle data */
+        data = nmea_parse(start, length, 0);
+        if (data == NULL) {
+            printf("Failed to parse the sentence!\n");
+            printf("  Type: %.5s (%d)\n", start + 1, nmea_get_type(start));
+        } else {
+            if (data->errors != 0) {
+                printf("WARN: The sentence struct contains parse errors!\n");
+            }
+
+            if (NMEA_GPGGA == data->type) {
+                printf("GPGGA sentence\n");
+                nmea_gpgga_s *gpgga = (nmea_gpgga_s *) data;
+                printf("Number of satellites: %d\n", gpgga->n_satellites);
+                printf("Altitude: %f %c\n", gpgga->altitude,
+                       gpgga->altitude_unit);
+            }
+
+            if (NMEA_GPGLL == data->type) {
+                printf("GPGLL sentence\n");
+                nmea_gpgll_s *pos = (nmea_gpgll_s *) data;
+                printf("Longitude:\n");
+                printf("  Degrees: %d\n", pos->longitude.degrees);
+                printf("  Minutes: %f\n", pos->longitude.minutes);
+                printf("  Cardinal: %c\n", (char) pos->longitude.cardinal);
+                printf("Latitude:\n");
+                printf("  Degrees: %d\n", pos->latitude.degrees);
+                printf("  Minutes: %f\n", pos->latitude.minutes);
+                printf("  Cardinal: %c\n", (char) pos->latitude.cardinal);
+                strftime(fmt_buf, sizeof(fmt_buf), "%H:%M:%S", &pos->time);
+                printf("Time: %s\n", fmt_buf);
+            }
+
+            if (NMEA_GPRMC == data->type) {
+                printf("GPRMC sentence\n");
+                nmea_gprmc_s *pos = (nmea_gprmc_s *) data;
+                printf("Longitude:\n");
+                printf("  Degrees: %d\n", pos->longitude.degrees);
+                printf("  Minutes: %f\n", pos->longitude.minutes);
+                printf("  Cardinal: %c\n", (char) pos->longitude.cardinal);
+                printf("Latitude:\n");
+                printf("  Degrees: %d\n", pos->latitude.degrees);
+                printf("  Minutes: %f\n", pos->latitude.minutes);
+                printf("  Cardinal: %c\n", (char) pos->latitude.cardinal);
+                strftime(fmt_buf, sizeof(fmt_buf), "%d %b %T %Y", &pos->date_time);
+                printf("Date & Time: %s\n", fmt_buf);
+                printf("Speed, in Knots: %f\n", pos->gndspd_knots);
+                printf("Track, in degrees: %f\n", pos->track_deg);
+                printf("Magnetic Variation:\n");
+                printf("  Degrees: %f\n", pos->magvar_deg);
+                printf("  Cardinal: %c\n", (char) pos->magvar_cardinal);
+                double adjusted_course = pos->track_deg;
+                if (NMEA_CARDINAL_DIR_EAST == pos->magvar_cardinal) {
+                    adjusted_course -= pos->magvar_deg;
+                } else if (NMEA_CARDINAL_DIR_WEST == pos->magvar_cardinal) {
+                    adjusted_course += pos->magvar_deg;
+                } else {
+                    printf("Invalid Magnetic Variation Direction!\n");
+                }
+
+                printf("Adjusted Track (heading): %f\n", adjusted_course);
+            }
+
+            if (NMEA_GPGSA == data->type) {
+                nmea_gpgsa_s *gpgsa = (nmea_gpgsa_s *) data;
+
+                printf("GPGSA Sentence:\n");
+                printf("  Mode: %c\n", gpgsa->mode);
+                printf("  Fix:  %d\n", gpgsa->fixtype);
+                printf("  PDOP: %.2lf\n", gpgsa->pdop);
+                printf("  HDOP: %.2lf\n", gpgsa->hdop);
+                printf("  VDOP: %.2lf\n", gpgsa->vdop);
+            }
+
+            if (NMEA_GPGSV == data->type) {
+                nmea_gpgsv_s *gpgsv = (nmea_gpgsv_s *) data;
+
+                printf("GPGSV Sentence:\n");
+                printf("  Num: %d\n", gpgsv->sentences);
+                printf("  ID:  %d\n", gpgsv->sentence_number);
+                printf("  SV:  %d\n", gpgsv->satellites);
+                printf("  #1:  %d %d %d %d\n", gpgsv->sat[0].prn, gpgsv->sat[0].elevation, gpgsv->sat[0].azimuth, gpgsv->sat[0].snr);
+                printf("  #2:  %d %d %d %d\n", gpgsv->sat[1].prn, gpgsv->sat[1].elevation, gpgsv->sat[1].azimuth, gpgsv->sat[1].snr);
+                printf("  #3:  %d %d %d %d\n", gpgsv->sat[2].prn, gpgsv->sat[2].elevation, gpgsv->sat[2].azimuth, gpgsv->sat[2].snr);
+                printf("  #4:  %d %d %d %d\n", gpgsv->sat[3].prn, gpgsv->sat[3].elevation, gpgsv->sat[3].azimuth, gpgsv->sat[3].snr);
+            }
+
+            if (NMEA_GPTXT == data->type) {
+                nmea_gptxt_s *gptxt = (nmea_gptxt_s *) data;
+
+                printf("GPTXT Sentence:\n");
+                printf("  ID: %d %d %d\n", gptxt->id_00, gptxt->id_01, gptxt->id_02);
+                printf("  %s\n", gptxt->text);
+            }
+
+            if (NMEA_GPVTG == data->type) {
+                nmea_gpvtg_s *gpvtg = (nmea_gpvtg_s *) data;
+
+                printf("GPVTG Sentence:\n");
+                printf("  Track [deg]:   %.2lf\n", gpvtg->track_deg);
+                printf("  Speed [kmph]:  %.2lf\n", gpvtg->gndspd_kmph);
+                printf("  Speed [knots]: %.2lf\n", gpvtg->gndspd_knots);
+            }
+
+            nmea_free(data);
+        }
+
+vTaskDelay(pdMS_TO_TICKS(1000));
+
+    }
+}
+#endif
+
+
+#ifdef useGPS
+/*
+typedef struct
+{
+    double latitude;
+    double longitude;
+    double speed_kmh; // 单位：千米每小时
+    double speed_ms;  // 单位：米每秒
+} GPS_data;
+*/
+
+
+void gps_task(void *arg)
+{
+
+
+for (;;) {
+
+            uint32_t notification_value = 0;
+
+        // 1. Wait indefinitely for any notification (e.g., the START signal)
+        // This call will block until xTaskNotify is called on this task.
+        xTaskNotifyWait(0,           /* Don't clear any bits on entry */
+                        ULONG_MAX,   /* Clear all bits on exit */
+                        &notification_value, /* Stores the notification value */
+                        portMAX_DELAY);      /* Block forever */
+
+        // 2. Check if the START signal was received
+        if (notification_value & START_BIT) {
+            ESP_LOGI(TAG, "START signal for GPS reading loop.");
+
+
+ESP_LOGI("GPS", "GPS starting");
+
+ESP_LOGD("GPS", "GPS Waiting for uart_mutex ...");
+if (xSemaphoreTake(uart_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+
+//_hasMutex = true;
+vTaskDelay(pdMS_TO_TICKS(100));
+
+
+   // const char *TAG = "GPS";
+    while (1)
+    {
+        GPS_data gps_data = gps_get_value();
+        ESP_LOGI("GPS", "lat:%f, lon:%f alt:%f", gps_data.latitude, gps_data.longitude, gps_data.altitude); 
+        ESP_LOGI("GPS", "speed:%f", gps_data.speed_ms); 
+        ESP_LOGI("GPS", "course:%f", gps_data.course);  
+        ESP_LOGI("GPS", "Date:%d/%d/%d Time:%d:%d:%d",gps_data.day, gps_data.month, gps_data.year, gps_data.hour, gps_data.minute,gps_data.second); 
+// Date:25/6/28 Time:15:34:42
+       // ESP_LOGI(TAG, "======================================================\n");
+         vTaskDelay(2000);
+       // vTaskDelay(1000 / portTICK_RATE_MS);
+
+                      // --- CRITICAL PART: Check for a STOP signal ---
+                uint32_t stop_signal_value = 0;
+                // Use a zero timeout to check instantly without blocking
+                xTaskNotifyWait(0, ULONG_MAX, &stop_signal_value, 0);
+
+                // 3. If a STOP signal was sent, break the inner loop
+                if (stop_signal_value & STOP_BIT) {
+                    ESP_LOGI(TAG, "STOP signal for GPS loop.");
+                    break; // Exit the inner "running" loop
+                }
+
+    }
+
+    xSemaphoreGive(uart_mutex);
+ESP_LOGD("GPS", "GPS Giving uart_mutex ...");
+}  // got mutex
+
+} // startbit
+} // outer loop wait for startbit
+
+}
+#endif
 
 // Task parameters structure (for potential future expansion)
 typedef struct {
     gpio_num_t pin;
     uint8_t times;
-    uint8_t interval_ms;
+    uint32_t interval_ms;
 } blink_task_params_t;
 
 // Static storage for task parameters
@@ -452,6 +828,9 @@ static void blink_task(void *pvParameter) {
     // Configure GPIO pin as output
  //   gpio_pad_select_gpio(BLINK_PIN);
     gpio_set_direction(blink_task_params.pin, GPIO_MODE_OUTPUT);
+
+//ESP_LOGI("BLINK", "blink_task %d %d %d", blink_task_params.pin,blink_task_params.times, blink_task_params.interval_ms );
+
 
     // Blink 'times' times with 'interval_ms' between blinks
     for (uint8_t i = 0; i < blink_task_params.times; i++) {
@@ -465,12 +844,70 @@ static void blink_task(void *pvParameter) {
 }
 
 // **Embedded Function to Initialize Blink Task**
-static void blink_task_init( gpio_num_t pin, uint8_t times, uint8_t interval_ms) {
+static void blink_task_init( gpio_num_t pin, uint8_t times, uint32_t interval_ms) {
     blink_task_params.pin = pin;
     blink_task_params.times = times;
     blink_task_params.interval_ms = interval_ms;
-    xTaskCreate(blink_task, "BlinkTask", 1024, NULL, 2, NULL);
+TaskHandle_t xHandle_blink = NULL;
+//  vTaskDelete( xHandle_blink );
+
+ //     if (xHandle_blink = NULL){
+//ESP_LOGI("BLINK", "blink_task_init %d %d %d", pin,times, interval_ms );
+
+    xTaskCreate(blink_task, "BlinkTask", 1024, NULL, 2, &xHandle_blink);
+ //     }
+
 }
+
+///// vibrator
+
+typedef struct {
+    gpio_num_t pin;
+    uint8_t times;
+    uint32_t interval_ms;
+} vibrator_task_params_t;
+
+// Static storage for task parameters
+static vibrator_task_params_t vibrator_task_params;
+
+// **Embedded Blink Task Function**
+static void vibrator_task(void *pvParameter) {
+    // Configure GPIO pin as output
+ //   gpio_pad_select_gpio(BLINK_PIN);
+    gpio_set_direction(vibrator_task_params.pin, GPIO_MODE_OUTPUT);
+
+//ESP_LOGI("BLINK", "blink_task %d %d %d", blink_task_params.pin,blink_task_params.times, blink_task_params.interval_ms );
+//ESP_LOGI("VIBRA", "vibrator_task %d %d %d", vibrator_task_params.pin,vibrator_task_params.times, vibrator_task_params.interval_ms );
+
+
+    // Blink 'times' times with 'interval_ms' between blinks
+    for (uint8_t i = 0; i < vibrator_task_params.times; i++) {
+        gpio_set_level(vibrator_task_params.pin, 1);
+        vTaskDelay(pdMS_TO_TICKS(vibrator_task_params.interval_ms / 2));
+        gpio_set_level(vibrator_task_params.pin, 0);
+        vTaskDelay(pdMS_TO_TICKS(vibrator_task_params.interval_ms - (vibrator_task_params.interval_ms / 2)));
+    }
+    gpio_set_level(vibrator_task_params.pin, 0); // Final state
+    vTaskDelete(NULL);
+}
+
+static void vibrator_task_init( gpio_num_t pin, uint8_t times, uint32_t interval_ms2) {
+    vibrator_task_params.pin = pin;
+    vibrator_task_params.times = times;
+    vibrator_task_params.interval_ms = interval_ms2;
+
+//TaskHandle_t xHandle_vibrator = NULL;
+// vTaskDelete( xHandle_vibrator );
+
+ //   if (!xHandle_vibrator){
+
+//ESP_LOGI("VIBRA", "vibrator_task_init %d %d %d", pin,times, interval_ms2 );
+
+    xTaskCreate(vibrator_task, "vibrator_task", 1024, NULL, 2, &xHandle_vibrator);
+ //   }
+
+}
+
 
 
 #ifdef useAccelerometer
@@ -516,17 +953,34 @@ void mpu9250_reader_task(void *pvParameters)
 
     ESP_LOGI("MPU9250_TASK", "Fusion task started.");
    vTaskDelay(pdMS_TO_TICKS(100));
-
+static int mpu9250_update_period = 100;
     while (1)
     {
+         vTaskDelay(pdMS_TO_TICKS(200));
+  
         uint32_t current_time = xTaskGetTickCount();
         float dt = (float)(current_time - last_update_time) / (float)configTICK_RATE_HZ;
+        
         last_update_time = current_time;
+ //   ESP_LOGI("MPU9250_TASK", "mpu9250 check update cur %d last %d",  current_time, last_update_time );
+
+ //  last_update_time = 0;
+//if (current_time - last_update_time > mpu9250_update_period ) {
+   //   last_update_time = current_time;
+  
+ ESP_LOGD("MUTEX2", "mpu9250 Waiting for g_i2c_bus mutex...");
  
-  vTaskDelay(pdMS_TO_TICKS(200));
-      
+        ESP_LOGD("MPU9250_TASK", "mpu9250 updating");
+
            if (xSemaphoreTake(g_i2c_bus_mutex, portMAX_DELAY) == pdTRUE) {
-            
+
+mpu_hasMutex = true;
+
+
+  ESP_LOGD("MUTEX2", "mpu9250 g_i2c_bus Mutex taken.");
+
+  ESP_LOGD("MPU9250_TASK", "Doing mi2c_master_transmit_receive");
+
 
         esp_err_t err = i2c_master_transmit_receive(
             mpu9250_dev_handle,
@@ -539,6 +993,9 @@ void mpu9250_reader_task(void *pvParameters)
 
         if (err == ESP_OK)
         {
+
+              ESP_LOGD("MPU9250_TASK", "mi2c_master_transmit_receive success");
+
             // --- Parse raw data and convert to physical units ---
             int16_t raw_accel_x = (raw_data[0] << 8) | raw_data[1];
             int16_t raw_accel_y = (raw_data[2] << 8) | raw_data[3];
@@ -586,7 +1043,7 @@ void mpu9250_reader_task(void *pvParameters)
         sensor_data.accel_y_g * sensor_data.accel_y_g +
         sensor_data.accel_z_g * sensor_data.accel_z_g
     );
-ESP_LOGD("MPU9250_TASK", "total_accel_magnitude: %f", total_accel_magnitude);
+ ESP_LOGD("MPU9250_TASK", "total_accel_magnitude: %f", total_accel_magnitude);
 // When the device is still, magnitude should be ~1.0. During free-fall, it's ~0.0.
     if (total_accel_magnitude > 1.3) { // Threshold for detecting free-fall
         ESP_LOGI("FALL_DETECT", "FREE-FALL DETECTED! Magnitude: %.2f g", total_accel_magnitude);
@@ -599,12 +1056,16 @@ ESP_LOGD("MPU9250_TASK", "total_accel_magnitude: %f", total_accel_magnitude);
     // You could trigger an alert here or set a flag for another task to see.
     }
 
-                  // ALWAYS give the mutex back
+               
+//if (mpu_hasMutex){
             xSemaphoreGive(g_i2c_bus_mutex);
-
+            mpu_hasMutex = false;
+              ESP_LOGD("MUTEX2", "mpu9250 g_i2c_bus Mutex given.");
+//}
       
     }
 
+//} // mpu9250_update_period
   
 }
     
@@ -628,7 +1089,7 @@ void data_processor_task(void *pvParameters)
         // Wait indefinitely until an item is available on the queue.
         if (xQueueReceive(mpu_data_queue, &received_data, portMAX_DELAY) == pdPASS)
         {
-
+ ESP_LOGD("PROCESSOR_TASK", "received data.");
 /*
          straight    Pitch: -25.00°, Roll: 159.13° 
           up   Pitch: -48.69°, Roll: 124.07°
@@ -658,14 +1119,141 @@ if (received_data.roll > 170 ){
 }
 */
 
+uint32_t current_time = xTaskGetTickCount();
+
+if ( abs(received_data.pitch -  last_pitch ) > acc_Move_limit || abs(received_data.roll -  last_roll) > acc_Move_limit ) {
+
+ ESP_LOGI("PROCESSOR_TASK", "Device is moved %.1f  %.1f current_time: %d last_movement: %d", abs(received_data.pitch -  last_pitch ), abs(received_data.roll -  last_roll), current_time, last_movement   );
+// PROCESSOR_TASK: Device is moved (Roll: -21.1). (Pitch: 5.0)  26.4  8.1 time: 7089
+// PROCESSOR_TASK: Device is moved (Roll: -26.9). (Pitch: 15.3)  25.3  13.9 current_time: 1374 last_movement: 1333
+// PROCESSOR_TASK: Device is moved (Roll: -14.0). (Pitch: 93.5)  1.0  32.7 current_time: 9440 last_movement: 1374
+ //   uint32_t current_time = xTaskGetTickCount();
+   // 35.4  7.0  current_time: 27785 last_movement: 10777
+
+
+   //     float dt = (float)(current_time - last_update_time) / (float)configTICK_RATE_HZ;
+    
+ //if (( current_time - last_movement ) > movement_timeout_sec * 1000){
+
+
+// if (!vl53l5cx_running ){
+// start vl53l5cx task
+        // 3. Give the semaphore. This will unblock the worker_task.
+ //       ESP_LOGW("PROCESSOR_TASK", "Signaling the worker task to start!");
+  //      xSemaphoreGive(g_binary_semaphore);
+#ifdef useVl53l5cx
+    ESP_LOGD("PROCESSOR_TASK", "Sending START signal to xHandle_vl53l5cx.");
+     xTaskNotify(xHandle_vl53l5cx, START_BIT, eSetBits);
+#endif
+
+#ifdef useUltrasound
+ ESP_LOGI("PROCESSOR_TASK", "Sending START signal to xHandle_ultrasonic.");
+  xTaskNotify( xHandle_ultrasonic, START_BIT, eSetBits);
+#endif
+  #ifdef useUltrasound_2
+   ESP_LOGI("PROCESSOR_TASK", "Sending START signal to xHandle_ultrasonic 2.");
+  xTaskNotify( xHandle_ultrasonic_2, START_BIT, eSetBits);
+#endif
+
+#ifdef useGPS
+ESP_LOGD("PROCESSOR_TASK", "Sending START signal to xHandle_GPS.");
+xTaskNotify( xHandle_GPS, START_BIT, eSetBits);
+#endif
+
+// 1. Declare a handle for the worker task
+//TaskHandle_t g_worker_task_handle = NULL;
+
+// xTaskNotifyGive(g_worker_task_handle);
+// ESP_LOGI("PROCESSOR_TASK", "vTaskResume( xHandle_vl53l5cx )");
+//vTaskResume( xHandle_vl53l5cx );
+//vl53l5cx_running = true;
+//}
+
+ last_movement = current_time;
+
+} // > acc_Move_limit
+
+
+
+if (( current_time - last_movement ) > movement_timeout_msec * 1000){ //vl53l5cx_running && 
+// stop vl53l5cx task
+// ESP_LOGI("PROCESSOR_TASK", "vTaskSuspend( xHandle_vl53l5cx )");
+ ESP_LOGD("PROCESSOR_TASK", "no movement, current_time %d last_movement %d", current_time, last_movement);
+
+gpio_set_level(RED_PIN_1, 0); 
+gpio_set_level(BLUE_PIN_1, 0);  
+gpio_set_level(GREEN_PIN_1, 0); 
+gpio_set_level(RED_PIN, 0); 
+gpio_set_level(BLUE_PIN, 0);  
+gpio_set_level(GREEN_PIN, 0); 
+
+ //xSemaphoreGive(g_i2c_bus_mutex);
+//ESP_LOGD("MUTEX1", "Given g_i2c_bus mutex before vTaskSuspend");
+#ifdef useVl53l5cx
+ ESP_LOGD("PROCESSOR_TASK", "Sending STOP signal to worker.");
+ xTaskNotify(xHandle_vl53l5cx, STOP_BIT, eSetBits);
+ #endif
+
+ #ifdef useUltrasound
+  ESP_LOGI("PROCESSOR_TASK", "Sending STOP_BIT  to xHandle_ultrasonic and xHandle_ultrasonic_2.");
+    xTaskNotify( xHandle_ultrasonic, STOP_BIT, eSetBits);
+#endif
+
+#ifdef useUltrasound_2
+    xTaskNotify( xHandle_ultrasonic_2, STOP_BIT, eSetBits);
+#endif
+
+#ifdef useGPS
+ESP_LOGD("PROCESSOR_TASK", "Sending STOP signal to xHandle_GPS.");
+xTaskNotify( xHandle_GPS, STOP_BIT, eSetBits);
+#endif
+
+//vTaskSuspend( xHandle_vl53l5cx );
+//vl53l5cx_running = false;
+     
+} // 
+
+
+// ESP_LOGI("VL53_TASK", "Device is moved (Roll: %.1f). (Pitch: %.1f)  %.1f  %.1f", current_orientation.pitch ,current_orientation.roll, abs(current_orientation.pitch -  last_pitch ), abs(current_orientation.roll -  last_roll)  );
+
+last_pitch = received_data.pitch;
+last_roll = received_data.roll;
+/*
+            if (current_orientation.pitch > 50.0) {
+                 ESP_LOGI("VL53_TASK", "Device is pointed RIGHT (Pitch: %.1f). Adjusting logic.", current_orientation.pitch);
+                 // e.g., Treat the top row of the sensor as the "forward" direction
+            } else if (current_orientation.pitch < -40.0) {
+                 ESP_LOGI("VL53_TASK", "Device is pointed LEFT (Pitch: %.1f). Ignoring floor.", current_orientation.pitch);
+                 // e.g., Filter out readings from the bottom rows
+            } else {
+                 // Device is relatively level, use default logic
+            }
+
+
+            if (current_orientation.roll > 140) {
+                ESP_LOGI("VL53_TASK", "Device is pointed DOWN (Pitch: %.1f). Adjusting logic.", current_orientation.pitch);
+                 // e.g., Treat the top row of the sensor as the "forward" direction
+            } else if (current_orientation.roll < 100) {
+                ESP_LOGI("VL53_TASK", "Device is pointed UP (Pitch: %.1f). Ignoring floor.", current_orientation.pitch);
+                 // e.g., Filter out readings from the bottom rows
+            } else {
+                 // Device is relatively level, use default logic
+            }
+*/
+
+
+
+
+
             // --- FUSED ORIENTATION DATA (Most Important Output) ---
            ESP_LOGD("PROCESSOR_TASK", "Orientation -> Pitch: %.2f°, Roll: %.2f°", received_data.pitch, received_data.roll);
         }
  vTaskDelay(pdMS_TO_TICKS(300));
 
 
-    }
+    } // while 1
 }
+
 #endif
 
 
@@ -864,7 +1452,28 @@ void rgb_led_constant(LedColor color, float strength_val) {
  
 #endif
 
+#ifdef useUart 
+void init_uart(void) {
+    // Configure UART parameters
+    const uart_config_t uart_config = {
+        .baud_rate = 9600,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
 
+    // Apply UART configuration
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    // Install UART driver with RX buffer and a small TX buffer
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, UART_BUFFER_SIZE, 512, 0, NULL, 0));
+
+    // Set UART mode explicitly
+    ESP_ERROR_CHECK(uart_set_mode(UART_NUM, UART_MODE_UART));
+}
+#endif
 
 static beeper_state_t beeper = {};
 
@@ -913,7 +1522,49 @@ void set_beeper_tone(uint32_t frequency_hz, bool enable) {
 }
 
 // Determine alert level based on distance
-alert_level_t get_alert_level(uint16_t distance_cm) {
+alert_level_t get_alert_level(uint16_t distance_cm, uint16_t measured_average_cm) {
+
+    // change levels if theres nothing near
+uint16_t average_cm_far = 250;
+uint16_t average_cm_close = 100;
+uint16_t average_cm_veryclose = 50;
+/*
+ if (measured_average_cm > average_cm_far){
+ALERT_IMMEDIATE_LIMIT = 100;
+ALERT_CLOSE_LIMIT  = 140;
+ALERT_MEDIUM_LIMIT  = 180;
+ALERT_MEDIUMFAR_LIMIT  = 220;
+ALERT_FAR_LIMIT  = 250;
+ALERT_VERYFAR_LIMIT  = 300;
+    }
+
+ if (measured_average_cm < average_cm_close){
+ALERT_IMMEDIATE_LIMIT = 20;
+ALERT_CLOSE_LIMIT  = 40;
+ALERT_MEDIUM_LIMIT  = 60;
+ALERT_MEDIUMFAR_LIMIT  = 80;
+ALERT_FAR_LIMIT  = 100;
+ALERT_VERYFAR_LIMIT  = 120;
+    }
+ if (measured_average_cm < average_cm_veryclose){
+ALERT_IMMEDIATE_LIMIT = 10;
+ALERT_CLOSE_LIMIT  = 20;
+ALERT_MEDIUM_LIMIT  = 30;
+ALERT_MEDIUMFAR_LIMIT  = 40;
+ALERT_FAR_LIMIT  = 50;
+ALERT_VERYFAR_LIMIT  = 60;
+    }
+*/
+
+/*
+ALERT_IMMEDIATE_LIMIT = 30; // measured_average_cm / 8
+ALERT_CLOSE_LIMIT  = measured_average_cm / 6;
+ALERT_MEDIUM_LIMIT  = measured_average_cm;
+ALERT_MEDIUMFAR_LIMIT  = measured_average_cm * 1.25;
+ALERT_FAR_LIMIT  = measured_average_cm * 2;
+ALERT_VERYFAR_LIMIT  = measured_average_cm * 3;
+*/
+
     if (distance_cm <= ALERT_IMMEDIATE_LIMIT ) { //+ HYSTERESIS
         return ALERT_IMMEDIATE;
     } else if (distance_cm <= ALERT_CLOSE_LIMIT ) {
@@ -932,19 +1583,92 @@ alert_level_t get_alert_level(uint16_t distance_cm) {
     }
 }
 
+#ifdef useUart 
+void uart_task(void *pvParameters) {
+    uint8_t data[4];
+
+
+    if (xSemaphoreTake(uart_mutex, portMAX_DELAY) == pdTRUE) {
+
+
+    while (1) {
+        // Read 4 bytes from UART
+        int len = uart_read_bytes(UART_NUM, data, 4, pdMS_TO_TICKS(UART_TIMEOUT_MS));
+
+        if (len == 4 && data[0] == 0xFF) {
+            // Calculate checksum
+            int sum = (data[0] + data[1] + data[2]) & 0xFF;
+            if (sum == data[3]) {
+                // Convert distance to centimeters
+                int distance = (data[1] << 8) | data[2];
+
+                if (distance > 30) {
+                    ESP_LOGI(TAG, "Distance: %.2f cm", distance / 10.0);
+                } else {
+                    ESP_LOGW(TAG, "Below the lower limit");
+                }
+            } else {
+                ESP_LOGE(TAG, "Checksum error (Received: 0x%02X, Expected: 0x%02X)", data[3], sum);
+            }
+        } else if (len > 0) {
+            ESP_LOGW(TAG, "Invalid data received");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+  xSemaphoreGive(uart_mutex);
+
+} // mutex
+}
+#endif
+
+void resetPins (){
+gpio_set_level(RED_PIN, 0); 
+gpio_set_level(BLUE_PIN, 0);  
+gpio_set_level(GREEN_PIN, 0); 
+gpio_set_level(RED_PIN_1, 0); 
+gpio_set_level(BLUE_PIN_1, 0);  
+gpio_set_level(GREEN_PIN_1, 0); 
+
+}
+
+
 // simplified update_beeper_alerts function
-void update_beeper_alerts(alert_level_t new_level) {
+void update_beeper_alerts(alert_level_t new_level, int direction) {
     uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    
+
+    const alert_config_t *config = &alert_configs[beeper.current_level];
+
+if (direction == 1){
+
+resetPins();
+
+
+// special for immediate close, always react
+if (new_level ==6){
+blink_task_init(RED_PIN_1, 5, 500); // 
+
+#ifdef useVibrator2
+vibrator_task_init( VIBRATORPIN, 1, 500);
+
+#endif
+//gpio_set_level(VIBRATORPIN, 1); 
+
+//gpio_set_level(RED_PIN_1, 1); 
+gpio_set_level(BLUE_PIN_1, 0);  
+gpio_set_level(GREEN_PIN_1, 0); 
+vTaskDelay(pdMS_TO_TICKS(100));
+        } //new_level ==6
+
+
     // Check if alert level changed
     if (new_level != beeper.current_level) {
         beeper.current_level = new_level;
         beeper.last_beep_time = 0;
         beeper.is_beeping = false;
         set_beeper_tone(0, false);
-    } 
-    
-    const alert_config_t *config = &alert_configs[beeper.current_level];
+     
 
     if (beeper.current_level == ALERT_SILENT) {
         if (beeper.is_beeping) {
@@ -952,52 +1676,86 @@ void update_beeper_alerts(alert_level_t new_level) {
             beeper.is_beeping = false;
         }
 
-gpio_set_level(RED_PIN_1, 0); 
-gpio_set_level(BLUE_PIN_1, 0);  
-gpio_set_level(GREEN_PIN_1, 0); 
 
 
 
         return;
-    } else {
+    } 
+    
+
 
  ESP_LOGI(TAG, "new_level %d", new_level);
 
-gpio_set_level(RED_PIN_1, 0); 
-gpio_set_level(BLUE_PIN_1, 0);  
-gpio_set_level(GREEN_PIN_1, 0); 
+//gpio_set_level(RED_PIN_1, 0); 
+//gpio_set_level(BLUE_PIN_1, 0);  
+//gpio_set_level(GREEN_PIN_1, 0); 
 
+//gpio_set_level(VIBRATORPIN, 0); 
 
-       if (new_level ==6){
-blink_task_init(RED_PIN_1, 5, 500); // 
+/*
+if (new_level ==6){
+    blink_task_init(RED_PIN_1, 5, 500); // 
 
-//gpio_set_level(RED_PIN_1, 1); 
-gpio_set_level(BLUE_PIN_1, 0);  
-gpio_set_level(GREEN_PIN_1, 0); 
-        }
+    #ifdef useVibrator2
+        vibrator_task_init( VIBRATORPIN, 20, 100);
+    #endif
+
+    //gpio_set_level(VIBRATORPIN, 1); 
+
+/   /gpio_set_level(RED_PIN_1, 1); 
+    gpio_set_level(BLUE_PIN_1, 0);  
+    gpio_set_level(GREEN_PIN_1, 0); 
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+*/
+
        if (new_level ==5){
+
+#ifdef useVibrator2
+vibrator_task_init( VIBRATORPIN, 5, 100);
+
+#endif
+
 gpio_set_level(RED_PIN_1, 1); 
 gpio_set_level(BLUE_PIN_1, 0);  
 gpio_set_level(GREEN_PIN_1, 0); 
+ vTaskDelay(pdMS_TO_TICKS(80));
         }
 if (new_level ==4 ){
  //   blink_task_init(BLUE_PIN_1, 5, 500); // 
+#ifdef useVibrator2
+vibrator_task_init( VIBRATORPIN, 4, 100);
+ 
+#endif
 gpio_set_level(RED_PIN_1, 0); 
 gpio_set_level(BLUE_PIN_1, 1);  
 gpio_set_level(GREEN_PIN_1, 0); 
+vTaskDelay(pdMS_TO_TICKS(60));
         }
 if (new_level ==3 ){
+#ifdef useVibrator2
+vibrator_task_init( VIBRATORPIN, 3, 100);
+
+#endif
 gpio_set_level(RED_PIN_1, 0); 
 gpio_set_level(BLUE_PIN_1, 1);  
 gpio_set_level(GREEN_PIN_1, 1); 
+ vTaskDelay(pdMS_TO_TICKS(50));
         }
 
         if (new_level ==2){
+vibrator_task_init( VIBRATORPIN, 1, 100);
+ vTaskDelay(pdMS_TO_TICKS(50));
 gpio_set_level(RED_PIN_1, 0); 
 gpio_set_level(BLUE_PIN_1, 0);  
 gpio_set_level(GREEN_PIN_1, 1); 
         }
         if (new_level ==1){
+gpio_set_level(RED_PIN_1, 0); 
+gpio_set_level(BLUE_PIN_1, 0);  
+gpio_set_level(GREEN_PIN_1, 0); 
+        }
+        if (new_level ==0){
 gpio_set_level(RED_PIN_1, 0); 
 gpio_set_level(BLUE_PIN_1, 0);  
 gpio_set_level(GREEN_PIN_1, 0); 
@@ -1019,8 +1777,51 @@ gpio_set_level(GREEN_PIN_1, 0);
             beeper.beep_start_time = current_time;
         }
     }
+    vTaskDelay(pdMS_TO_TICKS(200));
+} // direction 1
+
+else { // direction 2
+
+if (new_level == 3){
+//blink_task_init(BLUE_PIN_1, 5, 500); // 
+blink_task_init(GREEN_PIN, 1, 20);
 }
 
+
+// special for immediate close, always react
+if (new_level >= 4){
+//blink_task_init(BLUE_PIN_1, 5, 500); // 
+//blink_task_init(GREEN_PIN, 3, 100);
+
+#ifdef useVibrator2
+//vibrator_task_init( VIBRATORPIN, 2, 100);
+//vTaskDelay(pdMS_TO_TICKS(100));
+//vibrator_task_init( VIBRATORPIN, 2, 100);
+#endif
+//gpio_set_level(VIBRATORPIN, 1); 
+blink_task_init(RED_PIN, 3, 100);
+
+#ifdef useVibrator2
+vibrator_task_init( VIBRATORPIN2, 2, 100);
+#endif
+vTaskDelay(pdMS_TO_TICKS(200));
+blink_task_init(BLUE_PIN, 3, 200);
+//vTaskDelay(pdMS_TO_TICKS(200));
+
+#ifdef useVibrator2
+vibrator_task_init( VIBRATORPIN2, 2, 100);
+#endif
+vTaskDelay(pdMS_TO_TICKS(200));
+
+//gpio_set_level(GREEN_PIN_1, 0); 
+
+
+        } //new_level ==6
+vTaskDelay(pdMS_TO_TICKS(200));
+}
+
+//resetPins();
+}
 /*
 void system_monitor_task(void *pvParameters) {
     while(1) {
@@ -1034,57 +1835,20 @@ void system_monitor_task(void *pvParameters) {
 }
 */
 
-/**
- * @brief Attempts to fully recover the VL53L5CX sensor after it has stopped responding.
- * 
- * @param dev Pointer to the sensor's configuration/device struct.
- * @return true if recovery was successful, false otherwise.
- */
-bool vl53l5cx_recoverX(VL53L5CX_Configuration *dev)
-{
-    bool success = false;
-    ESP_LOGW(TAG, "Attempting full recovery of VL53L5CX sensor...");
-
-    // Take the I2C mutex and HOLD IT for the entire recovery process
-    if (xSemaphoreTake(g_i2c_bus_mutex, pdMS_TO_TICKS(1000)) == pdTRUE)
-    {
-        // Now we have exclusive access to the I2C bus. The MPU task is blocked.
-        
-        vl53l5cx_stop_ranging(dev);
-        // ... hardware reset ...
-
-
-        uint8_t status = vl53l5cx_init(dev);
-        if (status == 0) {
-            status = vl53l5cx_start_ranging(dev);
-            if (status == 0) {
-                ESP_LOGI(TAG, "VL53L5CX recovery successful!");
-                success = true;
-            } else {
-                ESP_LOGE(TAG, "Recovery failed: vl53l5cx_start_ranging() failed");
-            }
-        } else {
-            ESP_LOGE(TAG, "Recovery failed: vl53l5cx_init() failed");
-        }
-
-        // ALWAYS give the mutex back when done.
-        xSemaphoreGive(g_i2c_bus_mutex);
-    } else {
-        ESP_LOGE(TAG, "Recovery failed: Could not obtain I2C bus lock.");
-    }
-
-    return success;
-}
 
 bool vl53l5cx_recover(VL53L5CX_Configuration *dev) {
     ESP_LOGW(TAG, "Attempting VL53L5CX recovery...");
     
     // Take I2C mutex for recovery operations
+     ESP_LOGD("MUTEX3", "Waiting for I2C Mutex for recovery.");
     if (xSemaphoreTake(g_i2c_bus_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to take I2C mutex for recovery");
+        ESP_LOGE("MUTEX3", "Could not get I2C mutex for recovery");
+        vl53l5cx_hasMutex = false;
         return false;
     }
-    
+    ESP_LOGD("MUTEX3", "I2C Mutex taken for recovery.");
+vl53l5cx_hasMutex = true;
+
     uint8_t status;
     uint8_t isAlive;
     
@@ -1103,7 +1867,12 @@ bool vl53l5cx_recover(VL53L5CX_Configuration *dev) {
     status = vl53l5cx_is_alive(dev, &isAlive);
     if (!isAlive || status) {
         ESP_LOGE(TAG, "Sensor not alive after reset. Status: %d, Alive: %d", status, isAlive);
+
+        if (vl53l5cx_hasMutex){
         xSemaphoreGive(g_i2c_bus_mutex);
+        vl53l5cx_hasMutex = false;
+         ESP_LOGD("MUTEX3", "g_i2c_bus_mutex Mutex given 3.");
+        }
         return false;
     }
     
@@ -1112,7 +1881,11 @@ bool vl53l5cx_recover(VL53L5CX_Configuration *dev) {
     status = vl53l5cx_init(dev);
     if (status) {
         ESP_LOGE(TAG, "Re-initialization failed with status: %d", status);
+         if (vl53l5cx_hasMutex){
         xSemaphoreGive(g_i2c_bus_mutex);
+        vl53l5cx_hasMutex = false;
+         ESP_LOGD("MUTEX3", "g_i2c_bus_mutex Mutex given 4.");
+         }
         return false;
     }
     
@@ -1134,24 +1907,30 @@ bool vl53l5cx_recover(VL53L5CX_Configuration *dev) {
     if (status) {
         ESP_LOGE(TAG, "Failed to restart ranging: %d", status);
         xSemaphoreGive(g_i2c_bus_mutex);
+         ESP_LOGD("MUTEX3", "g_i2c_bus_mutex Mutex given 6.");
         return false;
     }
     
     // Release mutex
+     if (vl53l5cx_hasMutex){
     xSemaphoreGive(g_i2c_bus_mutex);
-    
+    vl53l5cx_hasMutex = false;
+    ESP_LOGD("MUTEX3", "g_i2c_bus_mutex Mutex given from recover.");
+     }
     ESP_LOGI(TAG, "VL53L5CX recovery successful!");
     return true;
 }
 
-
+#ifdef useVl53l5cx
 // New task function for the sensor loop
 void vl53l5cx_reader_task(void *pvParameters) {
+
+ESP_LOGI(TAG, "vl53l5cx_reader_task started. Will wait for a signal to run.");
 
 
     uint32_t minStackBytesRemaining = uxTaskGetStackHighWaterMark(NULL);
     ESP_LOGI(TAG, "Sensor Task: Initial Stack Remaining %d bytes", minStackBytesRemaining);
-    static uint32_t checkCounter = 0;
+    static uint32_t runCounter = 0;
    
    // --- Add a counter for consecutive "not ready" failures ---
     int not_ready_count = 0;
@@ -1214,15 +1993,42 @@ static led_state_t last_sent_led_state{};
 
 vTaskDelay(pdMS_TO_TICKS(200));
 
+for (;;) {
+
+            uint32_t notification_value = 0;
+
+        // 1. Wait indefinitely for any notification (e.g., the START signal)
+        // This call will block until xTaskNotify is called on this task.
+        xTaskNotifyWait(0,           /* Don't clear any bits on entry */
+                        ULONG_MAX,   /* Clear all bits on exit */
+                        &notification_value, /* Stores the notification value */
+                        portMAX_DELAY);      /* Block forever */
+
+        // 2. Check if the START signal was received
+        if (notification_value & START_BIT) {
+            ESP_LOGI(TAG, "START signal received! Entering vl53l5cx reading loop.");
+runCounter = 0;
+
+
+ESP_LOGD("MUTEX1", "vl53l5cx Waiting for g_i2c_bus mutex...");
 if (xSemaphoreTake(g_i2c_bus_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-  
+
+vl53l5cx_hasMutex = true;
+vTaskDelay(pdMS_TO_TICKS(100));
+
+
+  ESP_LOGD("MUTEX1", "vl53l5cx Mutex taken.");
         status = vl53l5cx_start_ranging(Dev);
 
 vTaskDelay(pdMS_TO_TICKS(500));
 
     if (status) {
         ESP_LOGE(TAG, "Failed to start ranging");
+         if (vl53l5cx_hasMutex){
         xSemaphoreGive(g_i2c_bus_mutex);
+        vl53l5cx_hasMutex = false;
+        ESP_LOGD("MUTEX1", "Failed, vl53l5cx Giving g_i2c_bus mutex...");
+         }
         vTaskDelete(NULL);
        return;
     }
@@ -1233,9 +2039,21 @@ vTaskDelay(pdMS_TO_TICKS(500));
 
 #ifdef useAccelerometer
 
+
        if (xQueueReceive(mpu_data_queue, &current_orientation, 0) == pdPASS) {
             // New orientation data is now stored in 'current_orientation'
         }
+
+/*
+if ( abs(current_orientation.pitch -  last_pitch ) > acc_Move_limit || abs(current_orientation.roll -  last_roll) > acc_Move_limit ) {
+
+ ESP_LOGI("VL53_TASK", "Device is moved (Roll: %.1f). (Pitch: %.1f)  %.1f  %.1f", current_orientation.pitch ,current_orientation.roll, abs(current_orientation.pitch -  last_pitch ), abs(current_orientation.roll -  last_roll)   );
+}
+// ESP_LOGI("VL53_TASK", "Device is moved (Roll: %.1f). (Pitch: %.1f)  %.1f  %.1f", current_orientation.pitch ,current_orientation.roll, abs(current_orientation.pitch -  last_pitch ), abs(current_orientation.roll -  last_roll)  );
+
+last_pitch = current_orientation.pitch;
+last_roll = current_orientation.roll;
+*/
 
 /*
             if (current_orientation.pitch > 50.0) {
@@ -1260,6 +2078,7 @@ vTaskDelay(pdMS_TO_TICKS(500));
             }
 */
 
+
 #endif
 
 
@@ -1267,10 +2086,13 @@ bool topAlert = false;
 bool bottomAlert = false;
 int centreAlert = 0;
 
+
+
         uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
         
         if (current_time - last_sensor_read >= SENSOR_READ_INTERVAL) {
             last_sensor_read = current_time;
+
 
          //   vTaskDelay(pdMS_TO_TICKS(100));
             status = vl53l5cx_check_data_ready(Dev, &isReady);
@@ -1281,14 +2103,21 @@ ESP_LOGD(TAG, "Status: %d %d", status, isReady);
 
             if(isReady) {
 
-            
+gpio_set_level(RED_PIN, 0); 
+gpio_set_level(BLUE_PIN, 0);  
+gpio_set_level(GREEN_PIN, 0); 
+
+gpio_set_level(RED_PIN_1, 0); 
+gpio_set_level(BLUE_PIN_1, 0);  
+gpio_set_level(GREEN_PIN_1, 0); 
+
+
   not_ready_count = 0; // Reset counter on success
                 vTaskDelay(pdMS_TO_TICKS(100));
                 vl53l5cx_get_ranging_data(Dev, &Results);
 
                 primary_distance_total = 0;
-
-
+                uint16_t distance_total = 0;
 
 
                 for(i = 0; i < 16; i++) {
@@ -1298,10 +2127,20 @@ ESP_LOGD(TAG, "Status: %d %d", status, isReady);
                         uint16_t primary_distance = 0;
                         primary_distance = Results.distance_mm[idx]/10;
 
-                        gridAlerts[i] = get_alert_level(primary_distance);
+// if( runCounter % 10 == 0 ) {
+                        distance_total += primary_distance;
+                        average_cm = distance_total/(i+1);
+
+ //                       ESP_LOGD(TAG, "average_cm %d %d", i, average_cm);
+// }
+if ( abs(average_cm - total_average_cm) > 50 ){
+    total_average_cm = average_cm; // update total if average_cm changed
+}
+
+
+                        gridAlerts[i] = get_alert_level(primary_distance, total_average_cm);
 
 //printf("grid %d:%d \n", i, gridAlerts[i]);
-
 
 
 if ((i % 4) == 0) {
@@ -1338,26 +2177,43 @@ if(primary_distance <= ALERT_CLOSE_LIMIT){
                     }
                 } // for every square
 
-  xSemaphoreGive(g_i2c_bus_mutex);
+// if( runCounter % 10 == 0 ) {
+average_cm = distance_total/16;
 
-
-                // Calculate average and update alerts
-                int average_distance = primary_distance_total/8;
-                alert_level_t alert_level_average = get_alert_level(average_distance);
-
-
-ESP_LOGI(TAG, "average tot:%d avg:%d", primary_distance_total, average_distance);
-
-if (centreAlert > 2){
-update_beeper_alerts(alert_level_t::ALERT_CLOSE);
-centreAlert = 0;
-} else {
-update_beeper_alerts(alert_level_average);
+if ( abs(average_cm - total_average_cm) > 50 ){
+    total_average_cm = average_cm; // update total if average_cm changed
 }
 
-gpio_set_level(RED_PIN, 0); 
-gpio_set_level(BLUE_PIN, 0);  
-gpio_set_level(GREEN_PIN, 0); 
+
+
+ ESP_LOGD(TAG, "average_cm final %d", total_average_cm);
+// }
+                // Calculate average and update alerts
+                int average_distance = primary_distance_total/8;
+                alert_level_t alert_level_average = get_alert_level(average_distance, total_average_cm);
+
+//ESP_LOGI(TAG, "average tot:%d avg prim:%d avg all:%d", primary_distance_total, average_distance, total_average_cm);
+
+
+if (centreAlert >= centreAlert_WarnLevel){
+update_beeper_alerts(alert_level_t::ALERT_IMMEDIATE, 1);
+ESP_LOGI(TAG, "centreAlert:%d ALERT_IMMEDIATE", centreAlert);
+//centreAlert = 0;
+} 
+/*
+else if (centreAlert > 3){
+update_beeper_alerts(alert_level_t::ALERT_CLOSE, 1);
+ESP_LOGI(TAG, "centreAlert:%d ALERT_CLOSE", centreAlert);
+
+} 
+*/
+else {
+update_beeper_alerts(alert_level_average, 1);
+ESP_LOGI(TAG, "centreAlert:%d alert_level_average %d", centreAlert, alert_level_average);
+}
+centreAlert = 0;
+
+
 
       if (topAlert){
 gpio_set_level(RED_PIN, 0); 
@@ -1370,7 +2226,9 @@ gpio_set_level(BLUE_PIN, 0);
 gpio_set_level(GREEN_PIN, 0); 
         }
       if (!bottomAlert && !topAlert){
-
+gpio_set_level(RED_PIN, 0); 
+gpio_set_level(BLUE_PIN, 0);  
+gpio_set_level(GREEN_PIN, 0); 
       }
 
             // --- Create and populate a single LED state object ---
@@ -1442,19 +2300,19 @@ ESP_LOGI(TAG, "LED state no change detected");
                                 printf("%2d", 1);
                                 break;
                             case alert_level_t::ALERT_FAR:
-                                printf("%2d", 1);
-                                break;
-                            case alert_level_t::ALERT_MEDIUMFAR:
                                 printf("%2d", 2);
                                 break;
-                            case alert_level_t::ALERT_MEDIUM:
+                            case alert_level_t::ALERT_MEDIUMFAR:
                                 printf("%2d", 3);
                                 break;
-                            case alert_level_t::ALERT_CLOSE:
+                            case alert_level_t::ALERT_MEDIUM:
                                 printf("%2d", 4);
                                 break;
-                            case alert_level_t::ALERT_IMMEDIATE:
+                            case alert_level_t::ALERT_CLOSE:
                                 printf("%2d", 5);
+                                break;
+                            case alert_level_t::ALERT_IMMEDIATE:
+                                printf("%2d", 6);
                                 break;
                         }
 
@@ -1474,61 +2332,99 @@ ESP_LOGI(TAG, "LED state no change detected");
 
         
               //  loop++;
-            } else {
+            } else { // not ready
            not_ready_count++;
             ESP_LOGW(TAG, "Sensor not ready or comms error. Count: %d/%d", not_ready_count, NOT_READY_THRESHOLD);
-            vTaskDelay(pdMS_TO_TICKS(50));
+            
 
             if (not_ready_count >= NOT_READY_THRESHOLD) {
                 ESP_LOGE(TAG, "Not ready threshold reached. Attempting recovery...");
-
-                 xSemaphoreGive(g_i2c_bus_mutex);
-
+                not_ready_count = 0;
+                 if (vl53l5cx_hasMutex){
+                xSemaphoreGive(g_i2c_bus_mutex);
+                ESP_LOGD("MUTEX1", "vl53l5cx g_i2c_bus Mutex given -> recovery.");
+                 }
+                vl53l5cx_hasMutex = false;
                 // Call the new, comprehensive recovery function
                 if (vl53l5cx_recover(Dev)) {
                     // Recovery was successful, reset the counter and continue.
-                    not_ready_count = 0;
+                    
                     vTaskDelay(pdMS_TO_TICKS(50));
                 } else {
                     // Catastrophic failure. The sensor couldn't be recovered.
                     // We can either try again after a long delay or stop the task.
                     ESP_LOGE(TAG, "Catastrophic recovery failure. Halting task.");
-                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    
+                    vTaskDelay(pdMS_TO_TICKS(500));
                     //vTaskDelete(NULL); // Or vTaskDelay for a long time...
                 }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(200)); // break, to regain ready state if not > NOT_READY_THRESHOLD
             }
 
             }
-VL53L5CX_WaitMs(&(Dev->platform), 20);
+//VL53L5CX_WaitMs(&(Dev->platform), 20);
             // printf("-------------------\n");
         } // SENSOR_READ_INTERVAL passed
            // Periodic Stack Check (e.g., every 10 iterations)
        
-        checkCounter++;
+        runCounter++;
 
  
-        if( checkCounter % 10 == 0 ) {
+        if( runCounter % 10 == 0 ) {
             minStackBytesRemaining = uxTaskGetStackHighWaterMark(NULL);
       //      ESP_LOGI(TAG, "Sensor Task Stack : %d bytes left", minStackBytesRemaining);
             if( minStackBytesRemaining < 100 ){
                 ESP_LOGW(TAG, "Sensor Task Stack Warning: %d bytes left", minStackBytesRemaining);
             }
         }
-    
-
+        
+     if (vl53l5cx_hasMutex){
+xSemaphoreGive(g_i2c_bus_mutex);
+ESP_LOGD("MUTEX1", "vl53l5cx Giving g_i2c_bus mutex...");
+     }
+vl53l5cx_hasMutex = false;
 
         // Small delay to prevent watchdog issues and allow other tasks to run
         vTaskDelay(pdMS_TO_TICKS(50));
 
 //esp_task_wdt_feed();
 
+               // --- CRITICAL PART: Check for a STOP signal ---
+                uint32_t stop_signal_value = 0;
+                // Use a zero timeout to check instantly without blocking
+                xTaskNotifyWait(0, ULONG_MAX, &stop_signal_value, 0);
+
+                // 3. If a STOP signal was sent, break the inner loop
+                if (stop_signal_value & STOP_BIT) {
+                    ESP_LOGI(TAG, "STOP signal received! vl53l5cx Exiting loop and going back to sleep.");
+                    break; // Exit the inner "running" loop
+                }
+
+                
      } // while 1 loop end
+
+if (vl53l5cx_hasMutex){
    xSemaphoreGive(g_i2c_bus_mutex);
+      ESP_LOGD("MUTEX1", "g_i2c_bus Mutex given.");
+}
+ vl53l5cx_hasMutex = false;
     } //  got mutex
         else {
-        ESP_LOGW(TAG, "No mutext");
+            vl53l5cx_hasMutex = false;
+        ESP_LOGW(TAG, "No mutex available");
     //    xSemaphoreGive(g_i2c_bus_mutex);
         }
+
+
+ 
+
+
+    }  // got semaphore  signal  
+
+
+
+} // waiting for g_binary_semaphore
 
     // Cleanup (though this won't be reached in normal operation)
     vl53l5cx_stop_ranging(Dev);
@@ -1536,6 +2432,455 @@ VL53L5CX_WaitMs(&(Dev->platform), 20);
     set_beeper_tone(0, false);
     vTaskDelete(NULL);
 }
+#endif
+
+ #ifdef useUltrasound
+ void ultrasonic_ranger(void *pvParameters) {
+
+    // ultrasound_mutex
+
+    ultrasonic_sensor_t sensor = {
+        .trigger_pin = TRIGGER_GPIO,
+        .echo_pin = ECHO_GPIO,
+    };
+
+uint32_t last_update_time = xTaskGetTickCount();
+static int ultrasonic_update_period = 5;
+/*
+  ultrasonic_sensor_t sensor = {
+    .trigger_pin, //!< GPIO output pin for trigger
+    .echo_pin,    //!< GPIO input pin for echo
+    .minDistance = 5,
+    .maxDistance = 300,
+    .maxRetry = 3,
+    .pulseTuning = 200,
+    .debug = false,
+} 
+*/
+
+  ultrasonic_init(&sensor);
+
+ //void parameters(int index,int trigPin, int echoPin, int minDistance = 5, int maxDistance = 300, int maxRetry = 3, int pulseTuning = 200, bool debug = false);
+
+//myObjSonar.parameters(2, trigPin3, echoPin3, 5, 300, 2, 130, true); 
+/*
+   gpio_num_t trigger_pin; //!< GPIO output pin for trigger
+    gpio_num_t echo_pin;    //!< GPIO input pin for echo
+    int minDistance = 5;
+    int maxDistance = 300;
+    int maxRetry = 3;
+    int pulseTuning = 200;
+    bool debug = false;
+*/
+
+
+ //   ultrasonic_init(&sensor2);
+
+
+
+for (;;) {
+
+            uint32_t notification_value = 0;
+
+        // 1. Wait indefinitely for any notification (e.g., the START signal)
+        // This call will block until xTaskNotify is called on this task.
+        xTaskNotifyWait(0,           /* Don't clear any bits on entry */
+                        ULONG_MAX,   /* Clear all bits on exit */
+                        &notification_value, /* Stores the notification value */
+                        portMAX_DELAY);      /* Block forever */
+
+        // 2. Check if the START signal was received
+        if (notification_value & START_BIT) {
+            ESP_LOGI(TAG, "START signal for ultrasonic reading loop 1.");
+
+//static int sensornumber = 0;
+//ultrasonic_sensor_t active_sensor = sensor;
+     uint32_t distance = 0;
+     uint32_t distance2 = 0;
+
+float temp = 25.0;
+// 
+
+    while (true)
+    {
+   
+
+//uint32_t active_distance = distance;
+
+//if (sensornumber == 0){
+//ultrasonic_sensor_t active_sensor = sensor;
+//active_distance = distance;
+//sensornumber = 1;
+//} else {
+//ultrasonic_sensor_t active_sensor = sensor2;
+//active_distance = distance2;
+//ensornumber = 0;
+//}  uint32_t current_time = xTaskGetTickCount();
+
+
+uint32_t current_time = xTaskGetTickCount();
+ last_update_time = 0;
+
+  if (xSemaphoreTake(ultrasound_mutex, portMAX_DELAY) == pdTRUE) {
+ ESP_LOGD(TAG, "ultrasound Got mutex .");
+            alert_level_t alert_level = ALERT_VERYFAR;
+    ///    alert_level_t alert_level_2 = ALERT_VERYFAR;
+
+
+
+//if (current_time - last_update_time > ultrasonic_update_period ) {
+// last_update_time = current_time;
+
+
+uint32_t u1_read_time = xTaskGetTickCount();
+        esp_err_t res = ultrasonic_measure_cm_temp_compensated(&sensor, MAX_DISTANCE_CM, &distance, temp);
+        if (res != ESP_OK)
+        {
+            printf("Error %d: ", res);
+            switch (res)
+            {
+                case ESP_ERR_ULTRASONIC_PING:
+                    printf("Cannot ping (device is in invalid state)\n");
+                    break;
+                case ESP_ERR_ULTRASONIC_PING_TIMEOUT:
+                    printf("Ping timeout (no device found)\n");
+                    break;
+                case ESP_ERR_ULTRASONIC_ECHO_TIMEOUT:
+                    printf("Echo timeout (i.e. distance too big)\n");
+                    alert_level = get_alert_level( 500, 200);
+                    break;
+                default:
+                    printf("%s\n", esp_err_to_name(res));
+            }
+        }
+        else {
+       //     printf("Distance from sensor %d: %lu\n", 1, distance);
+            alert_level = get_alert_level( distance, 200);
+        }
+
+
+
+//ESP_LOGI(TAG, "alert_level dist: %lu ",  distance);
+update_beeper_alerts(alert_level, 1);
+
+
+/*
+vTaskDelay(pdMS_TO_TICKS(400)); // wait for signal from sensor1 to die out
+
+////// sensor 2
+
+        res = ultrasonic_measure_cm(&sensor2, MAX_DISTANCE_CM, &distance2);
+        if (res != ESP_OK)
+        {
+            printf("Error %d: ", res);
+            switch (res)
+            {
+                case ESP_ERR_ULTRASONIC_PING:
+                    printf("Cannot ping (device is in invalid state)\n");
+                    break;
+                case ESP_ERR_ULTRASONIC_PING_TIMEOUT:
+                    printf("Ping timeout (no device found)\n");
+                    break;
+                case ESP_ERR_ULTRASONIC_ECHO_TIMEOUT:
+                    printf("Echo timeout (i.e. distance too big)\n");
+                    alert_level_2 = get_alert_level( 500, 200);
+                    break;
+                default:
+                    printf("%s\n", esp_err_to_name(res));
+            }
+        }
+        else {
+           // printf("Distance from sensors 1:%lu 2:%lu\n",  distance, distance2);
+         //   alert_level_2 = get_alert_level( distance2, 200);
+        }
+*/
+
+              
+//ESP_LOGI(TAG, "alert_level dist: %lu ",  distance);
+//  if (distance2 <= distance) {
+  //      alert_level_2 = get_alert_level( distance2, 200);
+   //     update_beeper_alerts(alert_level_2, 2);
+//  } else {
+        alert_level = get_alert_level( distance, 200);
+        update_beeper_alerts(alert_level, 1);
+//  }
+
+
+vTaskDelay(pdMS_TO_TICKS(200)); // wait for signal from sensor1 to die out
+////// sens 2
+     uint32_t distance2 = 0;
+   alert_level_t alert_level_2 = ALERT_VERYFAR;
+
+
+       ultrasonic_sensor_t sensor2 = {
+        .trigger_pin = TRIGGER_GPIO_2,
+        .echo_pin = ECHO_GPIO_2,
+    };
+    ultrasonic_init(&sensor2);
+
+uint32_t  min_time_between_ultrasound = 50;
+uint32_t u2_read_time = xTaskGetTickCount();
+
+while ( (u2_read_time - u1_read_time) < min_time_between_ultrasound){
+vTaskDelay(pdMS_TO_TICKS(20));
+u2_read_time = xTaskGetTickCount();
+ ESP_LOGI(TAG, "waiting for %d - %d > %d", u2_read_time, u1_read_time, min_time_between_ultrasound );
+}
+       res = ultrasonic_measure_cm_temp_compensated(&sensor2, MAX_DISTANCE_CM, &distance2, temp);
+        if (res != ESP_OK)
+        {
+            printf("Error %d: ", res);
+            switch (res)
+            {
+                case ESP_ERR_ULTRASONIC_PING:
+                    printf("Cannot ping (device is in invalid state)\n");
+                    break;
+                case ESP_ERR_ULTRASONIC_PING_TIMEOUT:
+                    printf("Ping timeout (no device found)\n");
+                    break;
+                case ESP_ERR_ULTRASONIC_ECHO_TIMEOUT:
+                    printf("Echo timeout (i.e. distance too big)\n");
+                    alert_level_2 = get_alert_level( 500, 200);
+                    break;
+                default:
+                    printf("%s\n", esp_err_to_name(res));
+            }
+        }
+        else {
+           // printf("Distance from sensors 1:%lu 2:%lu\n",  distance, distance2);
+         //   alert_level_2 = get_alert_level( distance2, 200);
+         
+        }
+
+    printf("Distance from sensors 1:%lu 2:%lu\n",  distance, distance2);
+                //  printf("Distance from sensors 2:%lu\n",  distance2);
+//ESP_LOGI(TAG, "alert_level dist: %lu ",  distance);
+//  if (distance2 <= distance) {
+        alert_level_2 = get_alert_level( distance2, 200);
+        update_beeper_alerts(alert_level_2, 2);
+//  } else {
+     //   alert_level = get_alert_level( distance, 200);
+      //  update_beeper_alerts(alert_level, 1);
+//  }
+
+
+xSemaphoreGive(ultrasound_mutex);
+ ESP_LOGD(TAG, "ultrasound gave mutex .");
+//vTaskDelay(pdMS_TO_TICKS(100));
+       // vTaskDelay(pdMS_TO_TICKS(500));
+
+        
+//            } //update time
+
+
+} // // got ultrasound_mutex 
+else {
+      ESP_LOGI(TAG, "No mutex for ultra 1."); 
+}
+
+               // --- CRITICAL PART: Check for a STOP signal ---
+                uint32_t stop_signal_value = 0;
+                // Use a zero timeout to check instantly without blocking
+                xTaskNotifyWait(0, ULONG_MAX, &stop_signal_value, 0);
+
+                // 3. If a STOP signal was sent, break the inner loop
+                if (stop_signal_value & STOP_BIT) {
+                    ESP_LOGI(TAG, "STOP signal for ultrasound loop.");
+                    break; // Exit the inner "running" loop
+                }
+vTaskDelay(pdMS_TO_TICKS(400));
+    }/// loop while true
+    
+
+
+} // start semaphore
+
+} // outer loop waiting for semaphore
+
+}
+#endif
+
+
+ #ifdef useUltrasound_2
+ void ultrasonic_ranger_2(void *pvParameters) {
+
+// ultrasound_mutex
+
+uint32_t last_update_time = xTaskGetTickCount();
+static int ultrasonic_update_period = 5;
+
+ //void parameters(int index,int trigPin, int echoPin, int minDistance = 5, int maxDistance = 300, int maxRetry = 3, int pulseTuning = 200, bool debug = false);
+
+//myObjSonar.parameters(2, trigPin3, echoPin3, 5, 300, 2, 130, true); 
+       ultrasonic_sensor_t sensor2 = {
+        .trigger_pin = TRIGGER_GPIO_2,
+        .echo_pin = ECHO_GPIO_2,
+    };
+    ultrasonic_init(&sensor2);
+
+
+
+for (;;) {
+
+            uint32_t notification_value = 0;
+
+        // 1. Wait indefinitely for any notification (e.g., the START signal)
+        // This call will block until xTaskNotify is called on this task.
+        xTaskNotifyWait(0,           /* Don't clear any bits on entry */
+                        ULONG_MAX,   /* Clear all bits on exit */
+                        &notification_value, /* Stores the notification value */
+                        portMAX_DELAY);      /* Block forever */
+
+        // 2. Check if the START signal was received
+        if (notification_value & START_BIT) {
+            ESP_LOGI(TAG, "START signal for ultrasonic reading loop 2.");
+
+
+     uint32_t distance2 = 0;
+
+// 
+   alert_level_t alert_level_2 = ALERT_VERYFAR;
+   
+    while (true)
+    {
+   
+    
+     
+
+//uint32_t active_distance = distance;
+
+//if (sensornumber == 0){
+//ultrasonic_sensor_t active_sensor = sensor;
+//active_distance = distance;
+//sensornumber = 1;
+//} else {
+//ultrasonic_sensor_t active_sensor = sensor2;
+//active_distance = distance2;
+//ensornumber = 0;
+//}  uint32_t current_time = xTaskGetTickCount();
+uint32_t current_time = xTaskGetTickCount();
+last_update_time = 0;
+
+
+ if (xSemaphoreTake(ultrasound_mutex, portMAX_DELAY) == pdTRUE) {
+ ESP_LOGI(TAG, "ultrasound2 Got mutex .");
+////// sensor 2
+
+
+if (current_time - last_update_time > ultrasonic_update_period ) {
+// last_update_time = current_time;
+
+float temp = 25.0;
+ 
+
+       esp_err_t res = ultrasonic_measure_cm_temp_compensated(&sensor2, MAX_DISTANCE_CM, &distance2, temp);
+        if (res != ESP_OK)
+        {
+            printf("Error %d: ", res);
+            switch (res)
+            {
+                case ESP_ERR_ULTRASONIC_PING:
+                    printf("Cannot ping (device is in invalid state)\n");
+                    break;
+                case ESP_ERR_ULTRASONIC_PING_TIMEOUT:
+                    printf("Ping timeout (no device found)\n");
+                    break;
+                case ESP_ERR_ULTRASONIC_ECHO_TIMEOUT:
+                    printf("Echo timeout (i.e. distance too big)\n");
+                    alert_level_2 = get_alert_level( 500, 200);
+                    break;
+                default:
+                    printf("%s\n", esp_err_to_name(res));
+            }
+        }
+        else {
+           // printf("Distance from sensors 1:%lu 2:%lu\n",  distance, distance2);
+         //   alert_level_2 = get_alert_level( distance2, 200);
+         
+        }
+
+
+                  printf("Distance from sensors 2:%lu\n",  distance2);
+//ESP_LOGI(TAG, "alert_level dist: %lu ",  distance);
+//  if (distance2 <= distance) {
+        alert_level_2 = get_alert_level( distance2, 200);
+        update_beeper_alerts(alert_level_2, 2);
+//  } else {
+     //   alert_level = get_alert_level( distance, 200);
+      //  update_beeper_alerts(alert_level, 1);
+//  }
+
+xSemaphoreGive(ultrasound_mutex);
+ ESP_LOGI(TAG, "ultrasound2 Gave mutex.");
+//vTaskDelay(pdMS_TO_TICKS(100));
+       // vTaskDelay(pdMS_TO_TICKS(500));
+
+            } //  if (xSemaphoreTake(ultrasound_mutex, portMAX_DELAY) == pdTRUE) {
+
+
+} // 
+
+else {
+
+    ESP_LOGI(TAG, "No mutex for ultra 2."); 
+}
+
+
+               // --- CRITICAL PART: Check for a STOP signal ---
+                uint32_t stop_signal_value = 0;
+                // Use a zero timeout to check instantly without blocking
+                xTaskNotifyWait(0, ULONG_MAX, &stop_signal_value, 0);
+
+                // 3. If a STOP signal was sent, break the inner loop
+                if (stop_signal_value & STOP_BIT) {
+                    ESP_LOGI(TAG, "STOP signal for ultrasound loop.");
+                    break; // Exit the inner "running" loop
+                }
+vTaskDelay(pdMS_TO_TICKS(200));
+    }/// loop while true
+    
+
+
+} // start semaphore
+
+} // outside forever loop
+
+}
+#endif
+
+/*
+void hcsr04_task(void *pvParameters)
+{
+    esp_err_t return_value = ESP_OK;
+    (void) UltrasonicInit();
+// GPIO pins to HC SR04 module
+//#define ESP_HCSR04_TRIGGER_PIN    CONFIG_TRIGGER_PIN   // define trigger IO pin 
+//#define ESP_HCSR04_ECHO_PIN       CONFIG_ECHO_PIN      // define echo IO pin 
+
+    
+    // create variable which stores the measured distance
+    static uint32_t afstand = 0;
+
+    while (1) {
+        return_value = UltrasonicMeasure(100, &afstand);
+        UltrasonicAssert(return_value);
+        if (return_value == ESP_OK) {
+            printf ("Afstand: %ld\n", afstand);
+             ESP_LOGI("ULTRA", "Afstand %ld", afstand);
+        }   else {
+
+    //        gpio_set_direction(ESP_HCSR04_TRIGGER_PIN, GPIO_MODE_OUTPUT);
+    //gpio_set_direction( ESP_HCSR04_ECHO_PIN, GPIO_MODE_INPUT);
+             ESP_LOGI("ULTRA", "hcsr04_task problem %x\n", return_value); //, ESP_HCSR04_TRIGGER_PIN, ESP_HCSR04_ECHO_PIN);
+           
+     //   ESP_LOGI(log_tag, "Measurement error: %x\n", return_value);
+        }  
+    
+        // 0,5 second delay before starting new measurement
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    } 
+}
+*/
 
 void find_reset_reason( int resetreason){
 
@@ -1590,27 +2935,37 @@ void find_reset_reason( int resetreason){
 
 extern "C" void app_main(void)
 {
- 
+ #ifdef useVibrator
      esp_task_wdt_config_t twdt_config = {
-        .timeout_ms = WATCHDOG_TIMEOUT_SEC * 1000,
+        .timeout_ms = WATCHDOG_TIMEOUT_MSEC * 1000,
         .idle_core_mask = (1 << CONFIG_FREERTOS_NUMBER_OF_CORES) - 1,    // Bitmask of all cores
         .trigger_panic = false,
     };
+#endif
+
+ #ifdef useGPS_2  
+    nmea_example_init_interface();
+   read_and_parse_nmea();
+#endif
 
 gpio_set_direction(RED_PIN, GPIO_MODE_OUTPUT);
 gpio_set_direction(BLUE_PIN, GPIO_MODE_OUTPUT);
 gpio_set_direction(GREEN_PIN, GPIO_MODE_OUTPUT);
-gpio_set_level(RED_PIN, 0); 
-gpio_set_level(BLUE_PIN, 0);  
-gpio_set_level(GREEN_PIN, 0); 
+//gpio_set_level(RED_PIN, 0); 
+//gpio_set_level(BLUE_PIN, 0);  
+//gpio_set_level(GREEN_PIN, 0); 
 
 
 gpio_set_direction(RED_PIN_1, GPIO_MODE_OUTPUT);
 gpio_set_direction(BLUE_PIN_1, GPIO_MODE_OUTPUT);
 gpio_set_direction(GREEN_PIN_1, GPIO_MODE_OUTPUT);
-gpio_set_level(RED_PIN_1, 0); 
-gpio_set_level(BLUE_PIN_1, 0);  
-gpio_set_level(GREEN_PIN_1, 0); 
+//gpio_set_level(RED_PIN_1, 0); 
+//gpio_set_level(BLUE_PIN_1, 0);  
+//gpio_set_level(GREEN_PIN_1, 0); 
+
+//gpio_set_direction(VIBRATORPIN, GPIO_MODE_OUTPUT); 
+//gpio_set_level(VIBRATORPIN, 0); 
+
 
 
     uint32_t last_sensor_read = 0;
@@ -1647,6 +3002,26 @@ gpio_set_level(GREEN_PIN_1, 0);
         return;
     }
 
+ #ifdef useGPS    
+            uart_mutex = xSemaphoreCreateMutex();
+    if (uart_mutex == NULL) {
+        ESP_LOGE("MAIN", "Fatal: Failed to create UART  mutex!");
+        return;
+    }
+#endif
+
+ #ifdef useUltrasound    
+            ultrasound_mutex = xSemaphoreCreateMutex();
+    if (ultrasound_mutex == NULL) {
+        ESP_LOGE("MAIN", "Fatal: Failed to create Ultrasound mutex!");
+        return;
+    }
+#endif
+
+// 1. Declare a global handle for the semaphore
+//SemaphoreHandle_t g_binary_semaphore;
+
+
 #ifdef useAccelerometer
         mpu_data_queue = xQueueCreate(5, sizeof(mpu_data_t));
 #endif
@@ -1656,72 +3031,27 @@ ESP_LOGI("MAIN", "Mutex and Queues created.");
 
 #ifdef useRGBLed
 configure_led();
-#endif
-
 //rgb_led_init();
 vTaskDelay(pdMS_TO_TICKS(100));
 
-#ifdef useRGBLed
-
-    // 3. Try to set the LED as testto RED 50%.");
-        rgb_led_set_color_with_brightness(255, 0, 0, 0.5); // 50% brightness red
- vTaskDelay(pdMS_TO_TICKS(500));
-    rgb_led_set_color_with_brightness(0, 255, 0, 0.5); // 50% brightness red
- vTaskDelay(pdMS_TO_TICKS(500));
-    rgb_led_set_color_with_brightness(0, 0, 255, 0.5); // 50% brightness red
- vTaskDelay(pdMS_TO_TICKS(500));
 #endif
 
-   // Initialize piezo beeper
-    esp_err_t ret = init_piezo_beeper();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize piezo beeper");
-        return;
-    }
-   ESP_LOGI(TAG, "initialized piezo beeper");
+#ifdef useGPS
+GPS_init();
 
-// --- 1. Declare necessary variables ---
-uint8_t status, isAlive;
-VL53L5CX_Configuration Dev; // Your main driver struct
+xTaskCreatePinnedToCore(
+                    gps_task,   /* Function to implement the task */
+                    "gps_task", /* Name of the task */
+                    1024 * 3,      /* Stack size in words */
+                    NULL,       /* Task input parameter */
+                    4,          /* Priority of the task */
+                    &xHandle_GPS,       /* Task handle. */
+                    0);  /* Core where the task should run */
+ 
 
-// --- 2. Define the I2C device configuration for the VL53L5CX ---
-i2c_device_config_t vl53_dev_cfg = {
-    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-    // Use the raw 7-bit address. The default is 0x29.
-    // The driver handles the R/W bit, so no shifting is needed.
-    .device_address = 0x29, 
-    .scl_speed_hz = VL53L5CX_MAX_CLK_SPEED,
-};
+ //   xTaskCreate(&gps_task, "gps_task", 1024 * 3, NULL, 5, &xHandle_GPS);
+#endif
 
-// --- 3. Add the device to the bus. This creates the handle. ---
-// The handle is stored inside your Dev struct, ready for the driver to use.
-ESP_LOGI(TAG, "Adding VL53L5CX sensor to I2C bus...");
-i2c_master_bus_add_device(bus_handle, &vl53_dev_cfg, &Dev.platform.handle);
-
-// --- 4. Now that communication is possible, perform hardware reset and init ---
-ESP_LOGI(TAG, "Resetting VL53L5CX sensor...");
-
-Dev.platform.reset_gpio = GPIO_NUM_5;
-VL53L5CX_Reset_Sensor(&(Dev.platform));
-
-// --- 5. Check if the sensor is alive (this uses the handle created in step 3) ---
-ESP_LOGI(TAG, "Checking if VL53L5CX is alive...");
-status = vl53l5cx_is_alive(&Dev, &isAlive);
-if (!isAlive || status) {
-    ESP_LOGE(TAG, "VL53L5CX not detected at address 0x29! Check wiring and address.");
-    return; // Stop here if sensor is not found
-}
-ESP_LOGI(TAG, "VL53L5CX is alive!");
-
-// --- 6. Initialize the sensor (this also uses the handle created in step 3) ---
-ESP_LOGI(TAG, "Initializing VL53L5CX ULD...");
-status = vl53l5cx_init(&Dev);
-if (status) {
-    ESP_LOGE(TAG, "VL53L5CX ULD Loading failed, error code: %d", status);
-    return;
-}
-
-ESP_LOGI(TAG, "VL53L5CX ULD ready! (Version: %s)", VL53L5CX_API_REVISION);
 
 #ifdef useAccelerometer
 
@@ -1755,40 +3085,140 @@ ESP_LOGI(TAG, "VL53L5CX ULD ready! (Version: %s)", VL53L5CX_API_REVISION);
     ESP_LOGI("MAIN", "Initialization complete. Tasks are running.");
 
  
+
+
+#ifdef useRGBLed
+
+    // 3. Try to set the LED as testto RED 50%.");
+        rgb_led_set_color_with_brightness(255, 0, 0, 0.5); // 50% brightness red
+ vTaskDelay(pdMS_TO_TICKS(500));
+    rgb_led_set_color_with_brightness(0, 255, 0, 0.5); // 50% brightness red
+ vTaskDelay(pdMS_TO_TICKS(500));
+    rgb_led_set_color_with_brightness(0, 0, 255, 0.5); // 50% brightness red
+ vTaskDelay(pdMS_TO_TICKS(500));
+#endif
+
+   // Initialize piezo beeper
+    esp_err_t ret = init_piezo_beeper();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize piezo beeper");
+        return;
+    }
+   ESP_LOGI(TAG, "initialized piezo beeper");
+
+#ifdef useVl53l5cx
+// --- 1. Declare necessary variables ---
+uint8_t status, isAlive;
+VL53L5CX_Configuration Dev; // Your main driver struct
+
+// --- 2. Define the I2C device configuration for the VL53L5CX ---
+i2c_device_config_t vl53_dev_cfg = {
+    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+    // Use the raw 7-bit address. The default is 0x29.
+    // The driver handles the R/W bit, so no shifting is needed.
+    .device_address = 0x29, 
+    .scl_speed_hz = VL53L5CX_MAX_CLK_SPEED,
+};
+
+
+// --- 3. Add the device to the bus. This creates the handle. ---
+// The handle is stored inside your Dev struct, ready for the driver to use.
+ESP_LOGI(TAG, "Adding VL53L5CX sensor to I2C bus...");
+i2c_master_bus_add_device(bus_handle, &vl53_dev_cfg, &Dev.platform.handle);
+
+// --- 4. Now that communication is possible, perform hardware reset and init ---
+ESP_LOGI(TAG, "Resetting VL53L5CX sensor...");
+
+Dev.platform.reset_gpio = GPIO_NUM_5;
+VL53L5CX_Reset_Sensor(&(Dev.platform));
+
+// --- 5. Check if the sensor is alive (this uses the handle created in step 3) ---
+ESP_LOGI(TAG, "Checking if VL53L5CX is alive...");
+status = vl53l5cx_is_alive(&Dev, &isAlive);
+if (!isAlive || status) {
+    ESP_LOGE(TAG, "VL53L5CX not detected at address 0x29! Check wiring and address.");
+    return; // Stop here if sensor is not found
+}
+ESP_LOGI(TAG, "VL53L5CX is alive!");
+
+// --- 6. Initialize the sensor (this also uses the handle created in step 3) ---
+ESP_LOGI(TAG, "Initializing VL53L5CX ULD...");
+status = vl53l5cx_init(&Dev);
+if (status) {
+    ESP_LOGE(TAG, "VL53L5CX ULD Loading failed, error code: %d", status);
+    return;
+}
+
+ESP_LOGI(TAG, "VL53L5CX ULD ready! (Version: %s)", VL53L5CX_API_REVISION);
+
     // Prepare task parameters
     static sensor_task_params_t task_params = {
         .dev = &Dev,
         .gridLayout = gridLayout,
         .gridAlerts = gridAlerts
     };
+#endif
 
  // --- 5. Create and Launch All Tasks ---
     ESP_LOGI("MAIN", "Creating tasks...");
 
-    #ifdef useRGBLed
+#ifdef useRGBLed
     ESP_LOGI("MAIN", "Creating task for RGB LED");
     // Create the LED task. It's now safe to start.
     xTaskCreate(led_control_task, "LED Control", 4096, NULL, 4, NULL);
 #endif
 
+
+#ifdef useUltrasound
+ // xTaskCreate(hcsr04_task, "HSRC04 task", 2048, NULL, 4, NULL);
+ xTaskCreatePinnedToCore(
+                    ultrasonic_ranger,   /* Function to implement the task */
+                    "ultrasonic_ranger", /* Name of the task */
+                    8192,      /* Stack size in words */
+                    NULL,       /* Task input parameter */
+                    5,          /* Priority of the task */
+                    &xHandle_ultrasonic,       /* Task handle. */
+                    1);  /* Core where the task should run */
+#endif
+//ultrasonic_ranger_2
+#ifdef useUltrasound_2
+xTaskCreatePinnedToCore(
+                    ultrasonic_ranger_2,   /* Function to implement the task */
+                    "ultrasonic_ranger_2", /* Name of the task */
+                    8192,      /* Stack size in words */
+                    NULL,       /* Task input parameter */
+                    5,          /* Priority of the task */
+                    &xHandle_ultrasonic_2,       /* Task handle. */
+                    0);  /* Core where the task should run */
+  //    xTaskCreate(ultrasonic_ranger, "ultrasonic_ranger", 8192 , NULL, 5, &xHandle_ultrasonic);
+#endif
+
+#ifdef useUartA02YYUW
+    init_uart();
+    xTaskCreate(uart_task, "UART Task", 4096, NULL, 5, NULL);
+#endif
+
     // Create sensor and data processing tasks
 #ifdef useAccelerometer
 ESP_LOGI("MAIN", "Creating task for Accelerometer");
-    xTaskCreate(mpu9250_reader_task, "MPU Reader", 4096, mpu9250_dev_handle, 5, NULL);
+
+    xTaskCreate(mpu9250_reader_task, "MPU Reader", 8192, mpu9250_dev_handle, 4, &xHandle_mpu);
 
 
-    xTaskCreate(data_processor_task, "Data Processor", 4096, NULL, 3, NULL);
+    xTaskCreate(data_processor_task, "Data Processor", 8192, NULL, 3, &xHandle_mpu_processor);
     #endif
 
 // Static storage for task parameters
 //static blink_task_params_t task_params;
+#ifdef useVl53l5cx
+    xTaskCreate(vl53l5cx_reader_task, "VL53L5CX Reader", 8192, &task_params, 5, &xHandle_vl53l5cx);
+#endif
 
-    xTaskCreate(vl53l5cx_reader_task, "VL53L5CX Reader", 8192, &task_params, 5, NULL);
-
+//vl53l5cx_running = false;
 ///// vibration
 
 //for (int i = 0; i < SAMPLE_CNT; ++i)
- 
+ #ifdef useVibrator
  example_ledc_init();
 uint32_t duty = 8000;
 int count = 0;
@@ -1807,8 +3237,52 @@ int count = 0;
  duty += 100;
         count++;
     }
+ #endif
 
+ /*
+ESP_LOGI(VLTAG, "Adding vl53l1x sensor to I2C bus...");
+//i2c_master_bus_add_device(bus_handle, &vl53_dev_cfg, &Dev.platform.handle);
 
+  if (vl53l1xInit(&dev, &bus_handle))
+    {
+        ESP_LOGI(VLTAG,"Lidar Sensor VL53L1X [OK]");
+    }
+    else
+    {
+        ESP_LOGI(VLTAG,"Lidar Sensor VL53L1X [FAIL]");
+        return;
+    }
+
+    VL53L1_StopMeasurement(&dev);
+    VL53L1_SetDistanceMode(&dev, VL53L1_DISTANCEMODE_MEDIUM);
+    VL53L1_SetMeasurementTimingBudgetMicroSeconds(&dev, 25000);
+
+     while(1){
+
+        VL53L1_StartMeasurement(&dev);
+
+        while (dataReady == 0)
+        {
+            status = VL53L1_GetMeasurementDataReady(&dev, &dataReady);
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        status = VL53L1_GetRangingMeasurementData(&dev, &rangingData);
+        range = rangingData.RangeMilliMeter;
+
+ESP_LOGI(VLTAG, "Measuremt range: %d", range);
+
+        VL53L1_StopMeasurement(&dev);    
+
+        VL53L1_StartMeasurement(&dev);
+
+        ESP_LOGI(TAG,"Distance %d mm",range);
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
+
+    }
+
+    */
 /*
 
     pwm_config_t config = {
